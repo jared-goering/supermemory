@@ -7,8 +7,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from config import get_config
-from memory_engine import MemoryEngine
+from supermemory.config import get_config
+from supermemory.engine import MemoryEngine
 
 cfg = get_config()
 
@@ -294,6 +294,11 @@ async def refresh_cache():
     return {"status": "ok", "memories_cached": len([m for m in _embed_meta if m is not None]), "built_at": str(_cache_built_at)}
 
 
-if __name__ == "__main__":
+def main():
+    """Entry point for supermemory serve command."""
     import uvicorn
     uvicorn.run(app, host=cfg["api_host"], port=cfg["api_port"])
+
+
+if __name__ == "__main__":
+    main()

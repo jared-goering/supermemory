@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 
-from memory_engine import MemoryEngine
+from supermemory.engine import MemoryEngine
 
 
 # ── Mock LLM responses ──────────────────────────────────────────────────────

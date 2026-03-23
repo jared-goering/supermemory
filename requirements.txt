@@ -1,4 +1,0 @@
-sentence-transformers>=2.2.0
-litellm>=1.0.0
-numpy>=1.24.0
-click>=8.0.0

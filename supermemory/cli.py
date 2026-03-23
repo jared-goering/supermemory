@@ -8,8 +8,8 @@ import sys
 
 import click
 
-from config import get_config, default_config_yaml, ensure_dirs
-from memory_engine import MemoryEngine
+from supermemory.config import get_config, default_config_yaml, ensure_dirs
+from supermemory.engine import MemoryEngine
 
 
 def get_engine(db: str) -> MemoryEngine:
@@ -179,6 +179,21 @@ def init(ctx):
     stats = engine.get_stats()
     click.echo(f"  {stats['total_memories']} memories, {stats['relations']} relations")
     click.echo("\nSupermemory initialized. Edit ~/.supermemory/config.yaml to customize.")
+
+
+@cli.command()
+@click.option("--host", default=None, help="Host to bind (default: from config)")
+@click.option("--port", default=None, type=int, help="Port to bind (default: from config)")
+def serve(host, port):
+    """Start the API server."""
+    from supermemory.server import main as serve_main
+    import uvicorn
+    cfg = get_config()
+    uvicorn.run(
+        "supermemory.server:app",
+        host=host or cfg.get("api_host", "0.0.0.0"),
+        port=port or cfg.get("api_port", 8642),
+    )
 
 
 if __name__ == "__main__":

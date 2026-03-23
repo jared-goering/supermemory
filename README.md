@@ -10,10 +10,25 @@ Local-first AI memory engine for agents. Supermemory extracts atomic facts from 
 
 **Local-first.** SQLite for storage, sentence-transformers for embeddings, any LLM via litellm for extraction. Nothing leaves your machine except the LLM calls, and you choose the provider.
 
+## Requirements
+
+- Python 3.10+
+- An LLM API key for ingestion (OpenAI, Anthropic, etc.)
+- Local search requires no API keys (uses local embeddings)
+
+## Installation
+
+```bash
+# Core installation (API-based embeddings)
+pip install supermemory
+
+# For local embeddings (recommended for privacy)
+pip install supermemory[local]
+```
+
 ## Quickstart
 
 ```bash
-pip install openclaw-supermemory
 export ANTHROPIC_API_KEY=sk-ant-...    # or any litellm-supported provider
 supermemory init
 supermemory ingest --text "Jared works at OpenClaw. He lives in Portland." --session demo --agent kit
@@ -33,6 +48,7 @@ supermemory search "Where does Jared live?"
 | `supermemory history ENTITY` | Show version history for an entity |
 | `supermemory profile ENTITY` | Show auto-built entity profile |
 | `supermemory stats` | Show database statistics |
+| `supermemory serve` | Start the API server (default: localhost:8642) |
 
 Options: `--db PATH` overrides the database path for any command.
 
@@ -41,9 +57,7 @@ Options: `--db PATH` overrides the database path for any command.
 Start the server:
 
 ```bash
-uvicorn server:app --host 0.0.0.0 --port 8642
-# or
-python server.py
+supermemory serve
 ```
 
 | Method | Endpoint | Description |
@@ -100,9 +114,12 @@ db_path: ~/.supermemory/memory.db
 # LLM model (any litellm-compatible model string)
 model: anthropic/claude-haiku-4-5
 
-# Embedding model (sentence-transformers model name)
+# Embeddings: "local" (sentence-transformers) or "litellm" (API-based)
+embedding_provider: local
+# For local: sentence-transformers model name
+# For litellm: e.g. "text-embedding-3-small", "cohere/embed-english-v3.0"
 embedding_model: all-MiniLM-L6-v2
-embedding_dim: 384
+embedding_dim: 384  # must match the model (e.g. 1536 for text-embedding-3-small)
 
 # API server
 api_port: 8642
@@ -129,6 +146,7 @@ session_scan_dirs:
 |----------|-----------|---------|
 | `SUPERMEMORY_DB_PATH` | `db_path` | `~/.supermemory/memory.db` |
 | `SUPERMEMORY_MODEL` | `model` | `anthropic/claude-haiku-4-5` |
+| `SUPERMEMORY_EMBEDDING_PROVIDER` | `embedding_provider` | `local` |
 | `SUPERMEMORY_EMBEDDING_MODEL` | `embedding_model` | `all-MiniLM-L6-v2` |
 | `SUPERMEMORY_EMBEDDING_DIM` | `embedding_dim` | `384` |
 | `SUPERMEMORY_API_PORT` | `api_port` | `8642` |
@@ -179,6 +197,6 @@ session_scan_dirs:
 
 MIT
 
-## Built by
+## Repository
 
-[OpenClaw](https://github.com/openclaw) — open-source tools for AI agent infrastructure.
+[jared-goering/supermemory](https://github.com/jared-goering/supermemory) — Local-first AI memory engine for agents.

@@ -20,7 +20,7 @@ from pathlib import Path
 ENGINE_DIR = os.environ.get("MEMORY_ENGINE_DIR", os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ENGINE_DIR)
 
-from config import get_config
+from supermemory.config import get_config
 
 _cfg = get_config()
 DB_PATH = _cfg["db_path"]
@@ -231,7 +231,7 @@ def run_ingest_cycle(state: dict, dry_run: bool = False, verbose: bool = False) 
 
     engine = None
     if not dry_run:
-        from memory_engine import MemoryEngine
+        from supermemory.engine import MemoryEngine
         engine = MemoryEngine(db_path=DB_PATH)
 
     for filepath, agent_id, session_id in sessions:

@@ -51,6 +51,7 @@ htmlcov/
 dist/
 *.tar.gz
 
-# Legacy
+# Legacy files and machine-specific config
 bulk_ingest.log
 bulk_state.json
+*.plist

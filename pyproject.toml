@@ -3,11 +3,11 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "openclaw-supermemory"
+name = "supermemory"
 version = "0.1.0"
 description = "Local-first AI memory engine with relational versioning and temporal grounding"
 readme = "README.md"
-license = "MIT"
+license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
     { name = "Jared Goering", email = "goering.jared@gmail.com" },
@@ -23,9 +23,10 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Database :: Front-Ends",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "sentence-transformers>=2.2.0",
     "litellm>=1.0.0",
     "numpy>=1.24.0",
     "click>=8.0.0",
@@ -35,21 +36,24 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+local = [
+    "sentence-transformers>=2.2.0",
+]
 ui = [
-    "react-force-graph-3d",
+    # Note: UI requires npm/pnpm to be installed separately
+    # Run: cd ui && npm install && npm run build
 ]
 
 [project.urls]
-Homepage = "https://github.com/openclaw/supermemory"
-Repository = "https://github.com/openclaw/supermemory"
-Issues = "https://github.com/openclaw/supermemory/issues"
+Homepage = "https://github.com/jared-goering/supermemory"
+Repository = "https://github.com/jared-goering/supermemory"
+Issues = "https://github.com/jared-goering/supermemory/issues"
 
 [project.scripts]
-supermemory = "cli:cli"
+supermemory = "supermemory.cli:cli"
 
 [tool.setuptools]
-packages = ["."]
-py-modules = ["cli", "config", "memory_engine", "server"]
+packages = ["supermemory"]
 
 [tool.setuptools.package-data]
-"." = ["py.typed"]
+supermemory = ["py.typed"]

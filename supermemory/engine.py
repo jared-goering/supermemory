@@ -22,7 +22,7 @@ def _get_sentence_transformer():
         SentenceTransformer = ST
     return SentenceTransformer
 
-from config import get_config
+from supermemory.config import get_config
 
 
 # ── Schema ───────────────────────────────────────────────────────────────────
