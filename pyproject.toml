@@ -50,9 +50,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/jared-goering/supermemory"
-Repository = "https://github.com/jared-goering/supermemory"
-Issues = "https://github.com/jared-goering/supermemory/issues"
+Homepage = "https://github.com/jared-goering/openclaw-supermemory"
+Repository = "https://github.com/jared-goering/openclaw-supermemory"
+Issues = "https://github.com/jared-goering/openclaw-supermemory/issues"
 
 [project.scripts]
 supermemory = "supermemory.cli:cli"
