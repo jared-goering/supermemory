@@ -43,6 +43,11 @@ ui = [
     # Note: UI requires npm/pnpm to be installed separately
     # Run: cd ui && npm install && npm run build
 ]
+dev = [
+    "ruff>=0.4.0",
+    "pytest>=7.0",
+    "pre-commit>=3.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/jared-goering/supermemory"
@@ -52,11 +57,7 @@ Issues = "https://github.com/jared-goering/supermemory/issues"
 [project.scripts]
 supermemory = "supermemory.cli:cli"
 
-[project.optional-dependencies.dev]
-# Development dependencies
-ruff = ["ruff>=0.4.0"]
-pytest = ["pytest>=7.0"]
-pre-commit = ["pre-commit>=3.0"]
+
 
 [tool.ruff]
 target-version = "py310"
