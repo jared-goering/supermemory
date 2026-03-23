@@ -3,10 +3,12 @@ OpenClaw Memory Engine — CLI Interface
 """
 
 import json
+import os
 import sys
 
 import click
 
+from config import get_config, default_config_yaml, ensure_dirs
 from memory_engine import MemoryEngine
 
 
@@ -15,12 +17,13 @@ def get_engine(db: str) -> MemoryEngine:
 
 
 @click.group()
-@click.option("--db", default="memory.db", help="Path to SQLite database file")
+@click.option("--db", default=None, help="Path to SQLite database file")
 @click.pass_context
 def cli(ctx, db):
     """OpenClaw Memory Engine — local-first structured agent memory."""
     ctx.ensure_object(dict)
-    ctx.obj["db"] = db
+    cfg = get_config()
+    ctx.obj["db"] = db or cfg["db_path"]
 
 
 @cli.command()
@@ -144,6 +147,38 @@ def stats(ctx):
         click.echo("  Categories:")
         for cat, count in sorted(s["categories"].items(), key=lambda x: -x[1]):
             click.echo(f"    {cat or 'uncategorized'}: {count}")
+
+
+@cli.command()
+@click.pass_context
+def init(ctx):
+    """Initialize ~/.supermemory/ with default config and empty database."""
+    from pathlib import Path
+
+    supermemory_dir = Path.home() / ".supermemory"
+    config_path = supermemory_dir / "config.yaml"
+    cfg = get_config()
+    db_path = cfg["db_path"]
+
+    # Create directory
+    supermemory_dir.mkdir(parents=True, exist_ok=True)
+    click.echo(f"Created {supermemory_dir}/")
+
+    # Write default config if it doesn't exist
+    if config_path.exists():
+        click.echo(f"Config already exists: {config_path}")
+    else:
+        config_path.write_text(default_config_yaml())
+        click.echo(f"Wrote default config: {config_path}")
+
+    # Create empty database
+    ensure_dirs(cfg)
+    engine = MemoryEngine(db_path=db_path)
+    click.echo(f"Database ready: {db_path}")
+
+    stats = engine.get_stats()
+    click.echo(f"  {stats['total_memories']} memories, {stats['relations']} relations")
+    click.echo("\nSupermemory initialized. Edit ~/.supermemory/config.yaml to customize.")
 
 
 if __name__ == "__main__":

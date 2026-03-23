@@ -1,6 +1,5 @@
 """FastAPI wrapper around MemoryEngine for the visualization UI."""
 
-import os
 from datetime import datetime
 from typing import Optional
 
@@ -8,7 +7,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from config import get_config
 from memory_engine import MemoryEngine
+
+cfg = get_config()
 
 app = FastAPI(title="Memory Engine API")
 app.add_middleware(
@@ -18,8 +20,59 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_PATH = os.environ.get("MEMORY_DB", "memory.db")
+DB_PATH = cfg["db_path"]
 engine = MemoryEngine(db_path=DB_PATH)
+
+# Pre-warm: load embedding matrix into memory on startup for fast search
+import numpy as np
+import sqlite3
+
+def _build_embedding_cache():
+    """Load all current embeddings into a numpy matrix for fast batch search."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """SELECT id, content, category, confidence, document_date, event_date,
+                  source_session, version, is_current, embedding
+           FROM memories WHERE is_current = 1 AND embedding IS NOT NULL"""
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return None, []
+
+    embed_dim = cfg["embedding_dim"]
+    matrix = np.empty((len(rows), embed_dim), dtype=np.float32)
+    metadata = []
+    for i, r in enumerate(rows):
+        blob = r["embedding"]
+        if blob and len(blob) == embed_dim * 4:
+            matrix[i] = np.frombuffer(blob, dtype=np.float32)
+            metadata.append({
+                "id": r["id"], "content": r["content"], "category": r["category"],
+                "confidence": r["confidence"], "document_date": r["document_date"],
+                "event_date": r["event_date"], "source_session": r["source_session"],
+                "version": r["version"], "is_current": bool(r["is_current"]),
+            })
+        else:
+            matrix[i] = 0
+            metadata.append(None)
+
+    return matrix, metadata
+
+_embed_matrix, _embed_meta = _build_embedding_cache()
+_cache_built_at = datetime.now()
+
+
+@app.get("/api/health")
+async def health():
+    """Health check endpoint."""
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    count = conn.execute("SELECT COUNT(*) FROM memories WHERE is_current = 1").fetchone()[0]
+    conn.close()
+    return {"status": "ok", "memories": count, "version": "0.1.0"}
 
 
 class IngestRequest(BaseModel):
@@ -143,6 +196,104 @@ async def entities():
     return {"entities": [r[0] for r in rows]}
 
 
+class RecallRequest(BaseModel):
+    query: str
+    top_k: int = 5
+    agent_id: Optional[str] = None
+
+
+@app.post("/api/recall")
+async def recall(req: RecallRequest):
+    """
+    Lightweight recall endpoint for agent startup.
+    Uses in-memory embedding cache for sub-100ms search.
+    Returns compact text blocks suitable for prompt injection.
+    """
+    global _embed_matrix, _embed_meta
+
+    if _embed_matrix is None or len(_embed_meta) == 0:
+        return {"text": "(no memories loaded)", "count": 0}
+
+    # Embed query using engine's embedder (already warm in server process)
+    query_vec = engine._embed(req.query)
+
+    # Single matrix-vector multiply: all similarities at once
+    similarities = _embed_matrix @ query_vec
+
+    # Get top_k indices
+    top_indices = np.argsort(similarities)[-req.top_k:][::-1]
+
+    lines = []
+    for idx in top_indices:
+        meta = _embed_meta[idx]
+        if meta is None:
+            continue
+        sim = float(similarities[idx])
+        cat = meta["category"]
+        content = meta["content"]
+        version = meta["version"]
+        lines.append(f"[{cat}] {content} (v{version}, {sim:.0%} match)")
+
+    return {
+        "text": "\n".join(lines),
+        "count": len(lines),
+    }
+
+
+class StartupContextRequest(BaseModel):
+    agent_id: str
+    queries: list[str] = ["current projects and priorities", "recent decisions", "known issues and blockers"]
+    top_k_per_query: int = 3
+
+
+@app.post("/api/startup-context")
+async def startup_context(req: StartupContextRequest):
+    """
+    Generate a compact context block for agent session startup.
+    Uses in-memory cache for fast multi-query recall. Deduplicates across queries.
+    """
+    global _embed_matrix, _embed_meta
+
+    if _embed_matrix is None:
+        return {"context": "(no memories)", "memory_count": 0, "queries": req.queries}
+
+    seen_ids = set()
+    sections = []
+
+    for query in req.queries:
+        query_vec = engine._embed(query)
+        similarities = _embed_matrix @ query_vec
+        top_indices = np.argsort(similarities)[-req.top_k_per_query * 2:][::-1]
+
+        lines = []
+        for idx in top_indices:
+            meta = _embed_meta[idx]
+            if meta is None or meta["id"] in seen_ids:
+                continue
+            seen_ids.add(meta["id"])
+            lines.append(f"- [{meta['category']}] {meta['content']}")
+            if len(lines) >= req.top_k_per_query:
+                break
+        if lines:
+            sections.append(f"## {query.title()}\n" + "\n".join(lines))
+
+    context_block = "\n\n".join(sections)
+    return {
+        "context": context_block,
+        "memory_count": len(seen_ids),
+        "queries": req.queries,
+    }
+
+
+@app.post("/api/cache/refresh")
+async def refresh_cache():
+    """Rebuild the in-memory embedding cache after new ingestions."""
+    global _embed_matrix, _embed_meta, _cache_built_at
+    _embed_matrix, _embed_meta = _build_embedding_cache()
+    _cache_built_at = datetime.now()
+    return {"status": "ok", "memories_cached": len([m for m in _embed_meta if m is not None]), "built_at": str(_cache_built_at)}
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8642)
+    uvicorn.run(app, host=cfg["api_host"], port=cfg["api_port"])

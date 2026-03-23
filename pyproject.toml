@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openclaw-supermemory"
+version = "0.1.0"
+description = "Local-first AI memory engine with relational versioning and temporal grounding"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Jared Goering", email = "goering.jared@gmail.com" },
+]
+keywords = ["ai", "memory", "embeddings", "knowledge-graph", "agents"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "sentence-transformers>=2.2.0",
+    "litellm>=1.0.0",
+    "numpy>=1.24.0",
+    "click>=8.0.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+ui = [
+    "react-force-graph-3d",
+]
+
+[project.urls]
+Homepage = "https://github.com/openclaw/supermemory"
+Repository = "https://github.com/openclaw/supermemory"
+Issues = "https://github.com/openclaw/supermemory/issues"
+
+[project.scripts]
+supermemory = "cli:cli"
+
+[tool.setuptools]
+packages = ["."]
+py-modules = ["cli", "config", "memory_engine", "server"]
+
+[tool.setuptools.package-data]
+"." = ["py.typed"]

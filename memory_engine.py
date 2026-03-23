@@ -13,6 +13,8 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 import litellm
 
+from config import get_config
+
 
 # ── Schema ───────────────────────────────────────────────────────────────────
 
@@ -115,24 +117,32 @@ Return ONLY a JSON object, no other text."""
 class MemoryEngine:
     """Local-first structured memory engine with temporal versioning and relations."""
 
-    def __init__(self, db_path: str = "memory.db", model_name: str = "anthropic/claude-haiku-4-5"):
-        self.db_path = db_path
-        self.model_name = model_name
+    def __init__(self, db_path: str | None = None, model_name: str | None = None):
+        cfg = get_config()
+        self.db_path = db_path or cfg["db_path"]
+        self.model_name = model_name or cfg["model"]
+        self._embedding_model = cfg["embedding_model"]
+        self._embedding_dim = cfg["embedding_dim"]
+        self._dedup_threshold = cfg["dedup_threshold"]
         self._embedder = None
         self._init_db()
 
     @property
     def embedder(self):
         if self._embedder is None:
-            self._embedder = SentenceTransformer("all-MiniLM-L6-v2")
+            self._embedder = SentenceTransformer(self._embedding_model)
         return self._embedder
 
     def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
             conn.executescript(SCHEMA_SQL)
 
     def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -211,10 +221,40 @@ class MemoryEngine:
         created_memories = []
 
         with self._conn() as conn:
+            # Load existing embeddings for semantic dedup check
+            existing_rows = conn.execute(
+                "SELECT id, embedding FROM memories WHERE is_current = 1 AND embedding IS NOT NULL"
+            ).fetchall()
+            if existing_rows:
+                _existing_matrix = np.empty((len(existing_rows), self._embedding_dim), dtype=np.float32)
+                for ei, er in enumerate(existing_rows):
+                    blob = er["embedding"]
+                    if blob and len(blob) == self._embedding_dim * 4:
+                        _existing_matrix[ei] = np.frombuffer(blob, dtype=np.float32)
+                    else:
+                        _existing_matrix[ei] = 0
+            else:
+                _existing_matrix = None
+
             # Build list of new memory records
             for i, mem_data in enumerate(extracted):
+                # Skip exact content duplicates
+                existing = conn.execute(
+                    "SELECT id FROM memories WHERE content = ? AND is_current = 1 LIMIT 1",
+                    (mem_data["content"],)
+                ).fetchone()
+                if existing:
+                    continue
+
                 mem_id = str(uuid.uuid4())
                 embedding = embeddings[i]
+
+                # Skip semantic near-duplicates (>0.97 cosine similarity)
+                if _existing_matrix is not None and len(existing_rows) > 0:
+                    sims = _existing_matrix @ embedding
+                    max_sim = float(np.max(sims))
+                    if max_sim > self._dedup_threshold:
+                        continue
 
                 conn.execute(
                     """INSERT INTO memories
@@ -464,11 +504,35 @@ class MemoryEngine:
             if not rows:
                 return []
 
-            # Compute similarities
+            # Batch vectorized similarity: stack all embeddings into matrix, single matmul
+            embed_dim = len(query_vec)
+            embeddings = np.empty((len(rows), embed_dim), dtype=np.float32)
+            valid_mask = []
+            for i, r in enumerate(rows):
+                blob = r["embedding"]
+                if blob and len(blob) == embed_dim * 4:
+                    embeddings[i] = np.frombuffer(blob, dtype=np.float32)
+                    valid_mask.append(True)
+                else:
+                    valid_mask.append(False)
+
+            # Single matrix-vector multiply for all similarities at once
+            similarities = embeddings @ query_vec  # (N,) dot products
+
+            # Build results with scores
+            scored = []
+            for i, r in enumerate(rows):
+                if not valid_mask[i]:
+                    continue
+                scored.append((similarities[i], i))
+
+            # Partial sort: only need top_k
+            scored.sort(key=lambda x: x[0], reverse=True)
+            top_indices = scored[:top_k]
+
             results = []
-            for r in rows:
-                vec = self._blob_to_vec(r["embedding"])
-                sim = self._cosine_similarity(query_vec, vec)
+            for sim, i in top_indices:
+                r = rows[i]
                 results.append({
                     "id": r["id"],
                     "content": r["content"],
@@ -480,12 +544,8 @@ class MemoryEngine:
                     "source_chunk": r["source_chunk"],
                     "version": r["version"],
                     "is_current": bool(r["is_current"]),
-                    "similarity": sim,
+                    "similarity": float(sim),
                 })
-
-            # Sort by similarity, take top_k
-            results.sort(key=lambda x: x["similarity"], reverse=True)
-            results = results[:top_k]
 
             # Expand relations for each result
             for result in results:
