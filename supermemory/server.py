@@ -56,7 +56,7 @@ def _build_embedding_cache():
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         """SELECT id, content, category, confidence, document_date, event_date,
-                  source_session, version, is_current, embedding
+                  source_session, source_chunk_id, version, is_current, embedding
            FROM memories WHERE is_current = 1 AND embedding IS NOT NULL"""
     ).fetchall()
     conn.close()
@@ -80,6 +80,7 @@ def _build_embedding_cache():
                     "document_date": r["document_date"],
                     "event_date": r["event_date"],
                     "source_session": r["source_session"],
+                    "source_chunk_id": r["source_chunk_id"],
                     "version": r["version"],
                     "is_current": bool(r["is_current"]),
                 }
@@ -197,15 +198,35 @@ async def search(req: SearchRequest):
                 "similarity": float(similarities[idx]),
                 "relations": [],
             }
-            if not req.include_source:
-                result.pop("source_chunk", None)
+            # Remove source_chunk_id from output (internal ref only)
+            result.pop("source_chunk_id", None)
             results.append(result)
 
-        # Hydrate relations from DB for top results
+        # Hydrate relations (and optionally source_chunks) from DB for top results
         conn = sqlite3.connect(DB_PATH, timeout=10)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.row_factory = sqlite3.Row
+
+        # Hydrate source_chunk text if requested
+        if req.include_source:
+            chunk_ids = [
+                _embed_meta[idx].get("source_chunk_id")
+                for idx in top_indices
+                if _embed_meta[idx] is not None and _embed_meta[idx].get("source_chunk_id")
+            ]
+            if chunk_ids:
+                placeholders = ",".join("?" for _ in chunk_ids)
+                chunk_rows = conn.execute(
+                    f"SELECT id, content FROM source_chunks WHERE id IN ({placeholders})",
+                    chunk_ids,
+                ).fetchall()
+                chunk_map = {r["id"]: r["content"] for r in chunk_rows}
+                for r_idx, idx in enumerate(top_indices):
+                    meta = _embed_meta[idx]
+                    if meta and meta.get("source_chunk_id"):
+                        results[r_idx]["source_chunk"] = chunk_map.get(meta["source_chunk_id"])
+
         for result in results:
             rels = conn.execute(
                 """SELECT mr.relation, mr.context, m.content as related_content,
@@ -362,7 +383,6 @@ async def add_alias(req: AliasRequest):
 class RecallRequest(BaseModel):
     query: str
     top_k: int = 5
-    agent_id: str | None = None
 
 
 @app.post("/api/recall")
@@ -404,7 +424,7 @@ async def recall(req: RecallRequest):
 
 
 class StartupContextRequest(BaseModel):
-    agent_id: str
+    agent_id: str | None = None  # reserved for future agent-scoped filtering
     queries: list[str] = [
         "current projects and priorities",
         "recent decisions",

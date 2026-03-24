@@ -129,23 +129,24 @@ def exact_content_dedup(db_path: str, dry_run: bool = False) -> dict[str, Any]:
                 (keeper, mid, keeper),
             )
 
-    # Delete orphaned relations (pointing to memories we're about to delete)
+    # Delete orphaned relations, entities, and source_chunks before memories (FK safe)
     if ids_to_delete:
-        conn.execute(
-            """
-            DELETE FROM memory_relations
-            WHERE from_memory IN ({ids}) OR to_memory IN ({ids})
-        """.format(ids=",".join("?" for _ in ids_to_delete)),
-            ids_to_delete + ids_to_delete,
-        )
-
-        # Delete the duplicate memories
         batch_size = 100
         deleted = 0
         for i in range(0, len(ids_to_delete), batch_size):
             batch = ids_to_delete[i : i + batch_size]
+            placeholders = ",".join("?" for _ in batch)
             conn.execute(
-                "DELETE FROM memories WHERE id IN ({})".format(",".join("?" for _ in batch)), batch
+                f"DELETE FROM memory_entities WHERE memory_id IN ({placeholders})",
+                batch,
+            )
+            conn.execute(
+                f"DELETE FROM memory_relations WHERE from_memory IN ({placeholders}) OR to_memory IN ({placeholders})",
+                batch + batch,
+            )
+            conn.execute(
+                f"DELETE FROM memories WHERE id IN ({placeholders})",
+                batch,
             )
             deleted += len(batch)
 
@@ -178,18 +179,19 @@ def exact_content_dedup(db_path: str, dry_run: bool = False) -> dict[str, Any]:
 
         if len(noise_ids) > 1:
             to_remove = [r["id"] for r in noise_ids[1:]]  # keep first, delete rest
-            # Clean relations first
+            # Clean entities, relations, then memories (FK safe order)
             if to_remove:
+                placeholders = ",".join("?" for _ in to_remove)
                 conn.execute(
-                    "DELETE FROM memory_relations WHERE from_memory IN ({ids}) OR to_memory IN ({ids})".format(
-                        ids=",".join("?" for _ in to_remove)
-                    ),
+                    f"DELETE FROM memory_entities WHERE memory_id IN ({placeholders})",
+                    to_remove,
+                )
+                conn.execute(
+                    f"DELETE FROM memory_relations WHERE from_memory IN ({placeholders}) OR to_memory IN ({placeholders})",
                     to_remove + to_remove,
                 )
                 conn.execute(
-                    "DELETE FROM memories WHERE id IN ({})".format(
-                        ",".join("?" for _ in to_remove)
-                    ),
+                    f"DELETE FROM memories WHERE id IN ({placeholders})",
                     to_remove,
                 )
                 noise_deleted += len(to_remove)
@@ -377,11 +379,15 @@ def semantic_dedup(
     delete_list = list(to_delete)
 
     if delete_list:
-        # Batch delete relations and memories
+        # Batch delete entities, relations, then memories (FK safe order)
         batch_size = 100
         for i in range(0, len(delete_list), batch_size):
             batch = delete_list[i : i + batch_size]
             placeholders = ",".join("?" for _ in batch)
+            conn.execute(
+                f"DELETE FROM memory_entities WHERE memory_id IN ({placeholders})",
+                batch,
+            )
             conn.execute(
                 f"DELETE FROM memory_relations WHERE from_memory IN ({placeholders}) OR to_memory IN ({placeholders})",
                 batch + batch,

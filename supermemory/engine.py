@@ -18,8 +18,14 @@ SentenceTransformer = None
 def _get_sentence_transformer():
     global SentenceTransformer
     if SentenceTransformer is None:
-        from sentence_transformers import SentenceTransformer as ST
-
+        try:
+            from sentence_transformers import SentenceTransformer as ST
+        except ImportError:
+            raise ImportError(
+                "sentence-transformers is required for local embeddings. "
+                "Install with: pip install openclaw-supermemory[local]\n"
+                "Or switch to API embeddings: set SUPERMEMORY_EMBEDDING_PROVIDER=litellm"
+            ) from None
         SentenceTransformer = ST
     return SentenceTransformer
 
@@ -160,6 +166,10 @@ class MemoryEngine:
     def __init__(self, db_path: str | None = None, model_name: str | None = None):
         cfg = get_config()
         self.db_path = db_path or cfg["db_path"]
+        # Ensure parent directories exist (fresh installs won't have ~/.supermemory/)
+        import os
+
+        os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
         self.model_name = model_name or cfg["model"]
         self._embedding_model = cfg["embedding_model"]
         self._embedding_dim = cfg["embedding_dim"]
@@ -305,10 +315,17 @@ class MemoryEngine:
         conn = self._conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            # Update all memory_entities rows
+            # Safe merge: INSERT OR IGNORE to handle PK (memory_id, entity_name) collisions,
+            # then DELETE the old rows. Avoids unique constraint violations when a memory
+            # already has both old_name and new_name.
             conn.execute(
-                "UPDATE memory_entities SET entity_name = ? WHERE entity_name = ?",
+                "INSERT OR IGNORE INTO memory_entities (memory_id, entity_name, entity_type) "
+                "SELECT memory_id, ?, entity_type FROM memory_entities WHERE entity_name = ?",
                 (new_name.strip(), old_name.strip()),
+            )
+            conn.execute(
+                "DELETE FROM memory_entities WHERE entity_name = ?",
+                (old_name.strip(),),
             )
             # Add alias mapping
             conn.execute(
@@ -626,7 +643,7 @@ class MemoryEngine:
 
         # Phase B: LLM call (no DB lock)
         profile_response = self._llm_call(
-            PROFILE_PROMPT.format(entity_name=entity_name, memories=memories_text)
+            PROFILE_PROMPT.format(entity_name=canonical, memories=memories_text)
         )
         try:
             profile_data = self._parse_json(profile_response)
@@ -636,24 +653,24 @@ class MemoryEngine:
         static = json.dumps(profile_data.get("static_profile", {}))
         dynamic = json.dumps(profile_data.get("dynamic_profile", {}))
 
-        # Phase C: Short write transaction
+        # Phase C: Short write transaction (use canonical name consistently)
         conn = self._conn()
         try:
             existing = conn.execute(
-                "SELECT id FROM profiles WHERE entity_name = ?", (entity_name,)
+                "SELECT id FROM profiles WHERE entity_name = ?", (canonical,)
             ).fetchone()
 
             if existing:
                 conn.execute(
                     "UPDATE profiles SET static_profile = ?, dynamic_profile = ?, "
                     "updated_at = datetime('now') WHERE entity_name = ?",
-                    (static, dynamic, entity_name),
+                    (static, dynamic, canonical),
                 )
             else:
                 conn.execute(
                     "INSERT INTO profiles (id, entity_name, static_profile, dynamic_profile) "
                     "VALUES (?, ?, ?, ?)",
-                    (str(uuid.uuid4()), entity_name, static, dynamic),
+                    (str(uuid.uuid4()), canonical, static, dynamic),
                 )
             conn.commit()
         finally:
@@ -858,11 +875,12 @@ class MemoryEngine:
     # ── Profile ──────────────────────────────────────────────────────────
 
     def get_profile(self, entity_name: str) -> dict | None:
-        """Return static + dynamic profile for an entity."""
+        """Return static + dynamic profile for an entity (resolves aliases)."""
         with self._conn() as conn:
+            canonical = self._resolve_entity(conn, entity_name)
             row = conn.execute(
                 "SELECT * FROM profiles WHERE entity_name = ?",
-                (entity_name,),
+                (canonical,),
             ).fetchone()
 
             if not row:
