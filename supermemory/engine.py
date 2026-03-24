@@ -107,6 +107,60 @@ CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity_
 CREATE INDEX IF NOT EXISTS idx_memory_entities_memory ON memory_entities(memory_id);
 CREATE INDEX IF NOT EXISTS idx_entity_aliases_canonical ON entity_aliases(canonical);
 CREATE INDEX IF NOT EXISTS idx_source_chunks_session ON source_chunks(session_key);
+
+-- Event extraction + clustering layer
+CREATE TABLE IF NOT EXISTS event_mentions (
+    id TEXT PRIMARY KEY,
+    session_key TEXT NOT NULL,
+    source_chunk_id TEXT,
+    event_type TEXT NOT NULL,
+    subtype TEXT,
+    summary TEXT NOT NULL,
+    participants TEXT,          -- JSON array
+    time_text TEXT,
+    normalized_date TEXT,
+    duration_minutes REAL,
+    user_involvement TEXT,
+    confidence REAL DEFAULT 0.0,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (source_chunk_id) REFERENCES source_chunks(id)
+);
+
+CREATE TABLE IF NOT EXISTS event_clusters (
+    id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    subtype TEXT,
+    canonical_label TEXT,
+    distinct_key TEXT NOT NULL,
+    participants TEXT,          -- JSON array
+    normalized_date TEXT,
+    duration_minutes REAL,
+    user_involvement TEXT,
+    confidence REAL DEFAULT 0.0,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS event_cluster_members (
+    cluster_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    PRIMARY KEY (cluster_id, event_id),
+    FOREIGN KEY (cluster_id) REFERENCES event_clusters(id),
+    FOREIGN KEY (event_id) REFERENCES event_mentions(id)
+);
+
+CREATE TABLE IF NOT EXISTS event_mention_memories (
+    event_id TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    PRIMARY KEY (event_id, memory_id),
+    FOREIGN KEY (event_id) REFERENCES event_mentions(id),
+    FOREIGN KEY (memory_id) REFERENCES memories(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_mentions_type ON event_mentions(event_type, subtype);
+CREATE INDEX IF NOT EXISTS idx_event_mentions_session ON event_mentions(session_key);
+CREATE INDEX IF NOT EXISTS idx_event_mentions_chunk ON event_mentions(source_chunk_id);
+CREATE INDEX IF NOT EXISTS idx_event_clusters_type ON event_clusters(event_type, subtype);
+CREATE INDEX IF NOT EXISTS idx_event_clusters_distinct ON event_clusters(distinct_key);
 """
 
 # ── LLM Prompts ──────────────────────────────────────────────────────────────
@@ -144,6 +198,34 @@ For each existing memory that has a relationship to the new one, return a JSON a
 If the new memory UPDATES an existing one (same topic, newer info), the old one should be superseded.
 
 Return ONLY a JSON array (empty array [] if no relationships found), no other text."""
+
+EVENT_EXTRACT_PROMPT = """Extract distinct events from this conversation text.
+An event is something that happened or will happen — a meeting, trip, exercise session, wedding, dinner, etc.
+Do NOT extract general facts, preferences, or background information — only specific episodes.
+
+For each event, return a JSON object with:
+- "event_type": broad category (e.g. "wedding", "exercise", "meeting", "art_event", "travel", "meal", "medical")
+- "subtype": more specific (e.g. "yoga", "jogging", "gallery_opening", "museum_visit") or null
+- "summary": one-sentence description of the event
+- "participants": JSON array of participant names (e.g. ["Rachel", "Mike"]), empty array if none mentioned
+- "time_text": raw temporal phrase from the text (e.g. "last week", "on Tuesday", "in June") or null
+- "normalized_date": ISO date string if a specific date is mentioned or clearly inferable, otherwise null
+- "duration_minutes": numeric duration in minutes if mentioned (e.g. 30 for "30 minutes of yoga"), otherwise null
+- "user_involvement": one of "attended", "did", "planned", "discussed", "observed" — how the user relates to this event
+- "confidence": float 0-1 indicating certainty this is a real episodic event (1.0 = explicitly stated, 0.5 = implied)
+
+Only extract episodic events (things that actually happened at a specific time).
+Do NOT extract habitual activities described as routines (e.g. "I usually jog every morning").
+If a habitual activity has a specific instance mentioned (e.g. "I jogged for 30 minutes on Tuesday"), extract that instance.
+
+Document date for temporal reference: {document_date}
+
+Conversation text:
+---
+{text}
+---
+
+Return ONLY a JSON array of event objects, no other text. Return empty array [] if no events found."""
 
 PROFILE_PROMPT = """Given these memories about the entity "{entity_name}", build a profile.
 
@@ -677,6 +759,188 @@ class MemoryEngine:
             conn.close()
 
     # _update_profile removed — replaced by _update_profile_safe above
+
+    # ── Event Extraction ─────────────────────────────────────────────────
+
+    def extract_events(
+        self,
+        text: str,
+        session_key: str,
+        chunk_id: str | None = None,
+        document_date: str | None = None,
+    ) -> list[dict]:
+        """
+        Extract structured events from text, cluster them, and link to memories.
+
+        Returns list of created event_mention dicts.
+        """
+        if document_date is None:
+            document_date = datetime.now().isoformat()[:10]
+
+        # LLM extraction (no DB lock)
+        prompt = EVENT_EXTRACT_PROMPT.format(text=text, document_date=document_date)
+        response = self._llm_call(prompt)
+        try:
+            events = self._parse_json(response)
+        except (json.JSONDecodeError, ValueError):
+            return []
+
+        if not events or not isinstance(events, list):
+            return []
+
+        created = []
+        conn = self._conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            for ev in events:
+                if not isinstance(ev, dict):
+                    continue
+                event_type = ev.get("event_type", "").strip()
+                if not event_type:
+                    continue
+
+                mention_id = str(uuid.uuid4())
+                participants = ev.get("participants", [])
+                if not isinstance(participants, list):
+                    participants = []
+                participants_json = json.dumps(
+                    sorted([str(p).strip() for p in participants if str(p).strip()])
+                )
+
+                summary = ev.get("summary", "").strip()
+                if not summary:
+                    continue
+
+                subtype = ev.get("subtype")
+                if subtype:
+                    subtype = subtype.strip()
+                time_text = ev.get("time_text")
+                normalized_date = ev.get("normalized_date")
+                duration_minutes = ev.get("duration_minutes")
+                user_involvement = ev.get("user_involvement", "attended")
+                confidence = ev.get("confidence", 0.5)
+
+                # Insert event mention
+                conn.execute(
+                    """INSERT INTO event_mentions
+                       (id, session_key, source_chunk_id, event_type, subtype,
+                        summary, participants, time_text, normalized_date,
+                        duration_minutes, user_involvement, confidence)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        mention_id,
+                        session_key,
+                        chunk_id,
+                        event_type,
+                        subtype,
+                        summary,
+                        participants_json,
+                        time_text,
+                        normalized_date,
+                        duration_minutes,
+                        user_involvement,
+                        confidence,
+                    ),
+                )
+
+                # Link to memories sharing the same chunk_id
+                if chunk_id:
+                    memory_rows = conn.execute(
+                        "SELECT id FROM memories WHERE source_chunk_id = ?",
+                        (chunk_id,),
+                    ).fetchall()
+                    for row in memory_rows:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO event_mention_memories (event_id, memory_id) "
+                            "VALUES (?, ?)",
+                            (mention_id, row["id"]),
+                        )
+
+                # Deterministic clustering by distinct_key
+                sorted_participants = json.loads(participants_json)
+                distinct_key = self._compute_event_distinct_key(
+                    event_type, sorted_participants, normalized_date
+                )
+
+                existing_cluster = conn.execute(
+                    "SELECT id FROM event_clusters WHERE distinct_key = ?",
+                    (distinct_key,),
+                ).fetchone()
+
+                if existing_cluster:
+                    cluster_id = existing_cluster["id"]
+                    conn.execute(
+                        "INSERT OR IGNORE INTO event_cluster_members (cluster_id, event_id) "
+                        "VALUES (?, ?)",
+                        (cluster_id, mention_id),
+                    )
+                    # Update cluster confidence if this mention is higher
+                    conn.execute(
+                        "UPDATE event_clusters SET confidence = MAX(confidence, ?) WHERE id = ?",
+                        (confidence, cluster_id),
+                    )
+                else:
+                    cluster_id = str(uuid.uuid4())
+                    conn.execute(
+                        """INSERT INTO event_clusters
+                           (id, event_type, subtype, canonical_label, distinct_key,
+                            participants, normalized_date, duration_minutes,
+                            user_involvement, confidence)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            cluster_id,
+                            event_type,
+                            subtype,
+                            summary,
+                            distinct_key,
+                            participants_json,
+                            normalized_date,
+                            duration_minutes,
+                            user_involvement,
+                            confidence,
+                        ),
+                    )
+                    conn.execute(
+                        "INSERT INTO event_cluster_members (cluster_id, event_id) VALUES (?, ?)",
+                        (cluster_id, mention_id),
+                    )
+
+                created.append(
+                    {
+                        "id": mention_id,
+                        "event_type": event_type,
+                        "subtype": subtype,
+                        "summary": summary,
+                        "participants": sorted_participants,
+                        "cluster_id": cluster_id,
+                        "distinct_key": distinct_key,
+                    }
+                )
+
+            conn.commit()
+        finally:
+            conn.close()
+
+        return created
+
+    @staticmethod
+    def _compute_event_distinct_key(
+        event_type: str,
+        participants: list[str],
+        normalized_date: str | None,
+    ) -> str:
+        """Compute a deterministic key for event clustering.
+
+        Key format: event_type|sorted_participants|normalized_date
+        """
+        parts = [event_type.lower().strip()]
+        if participants:
+            parts.append(",".join(p.lower().strip() for p in sorted(participants)))
+        else:
+            parts.append("")
+        parts.append(normalized_date or "")
+        return "|".join(parts)
 
     # ── Search ───────────────────────────────────────────────────────────
 

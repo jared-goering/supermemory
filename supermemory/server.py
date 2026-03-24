@@ -1,6 +1,9 @@
 """FastAPI wrapper around MemoryEngine for the visualization UI."""
 
+import asyncio
+import json
 from datetime import datetime
+from functools import partial
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -151,11 +154,16 @@ class SearchRequest(BaseModel):
 
 @app.post("/api/ingest")
 async def ingest(req: IngestRequest):
-    memories = engine.ingest(
-        req.text,
-        session_key=req.session_key,
-        agent_id=req.agent_id,
-        document_date=req.document_date,
+    loop = asyncio.get_event_loop()
+    memories = await loop.run_in_executor(
+        None,
+        partial(
+            engine.ingest,
+            req.text,
+            session_key=req.session_key,
+            agent_id=req.agent_id,
+            document_date=req.document_date,
+        ),
     )
     # Auto-refresh cache after ingest so search/recall see new memories immediately
     if memories:
@@ -165,8 +173,115 @@ async def ingest(req: IngestRequest):
     return {"memories": memories, "count": len(memories)}
 
 
+class IngestRawRequest(BaseModel):
+    """Lightweight ingest: chunk + embed without LLM extraction.
+    Good for benchmarks and bulk RAG-style ingestion."""
+
+    text: str
+    session_key: str = "raw"
+    agent_id: str = "raw"
+    document_date: str | None = None
+    chunk_size: int = 512  # chars per chunk
+    chunk_overlap: int = 64
+
+    @field_validator("text")
+    @classmethod
+    def validate_text_size(cls, v):
+        max_bytes = cfg.get("max_ingest_bytes", 51200)
+        if len(v.encode("utf-8")) > max_bytes:
+            raise ValueError(f"Ingest text exceeds maximum size of {max_bytes} bytes")
+        return v
+
+
+@app.post("/api/ingest_raw")
+async def ingest_raw(req: IngestRawRequest):
+    """Chunk text and embed directly into memories, no LLM extraction.
+    Much faster than /api/ingest (~10ms per chunk vs ~3s per LLM call)."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, partial(_ingest_raw_sync, req))
+
+
+def _ingest_raw_sync(req: IngestRawRequest):
+    """Sync implementation of ingest_raw, runs in thread pool."""
+    import uuid
+
+    # Simple sentence-aware chunking
+    text = req.text.strip()
+    if not text:
+        return {"count": 0, "chunks": 0}
+
+    # Split into chunks respecting sentence boundaries
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + req.chunk_size
+        if end < len(text):
+            # Try to break at a sentence boundary
+            for sep in ["\n\n", "\n", ". ", "? ", "! "]:
+                boundary = text.rfind(sep, start + req.chunk_size // 2, end + 50)
+                if boundary > start:
+                    end = boundary + len(sep)
+                    break
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start = end - req.chunk_overlap if end < len(text) else end
+
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+
+    # Store source chunk
+    source_id = None
+    if len(text) > 200:
+        chunk_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO source_chunks (id, content, session_key, agent_id, document_date) VALUES (?, ?, ?, ?, ?)",
+            (chunk_id, text[:5000], req.session_key, req.agent_id, req.document_date),
+        )
+        source_id = chunk_id
+
+    inserted = 0
+    for chunk in chunks:
+        embedding = engine._embed(chunk)
+        mem_id = str(uuid.uuid4())
+        blob = embedding.tobytes() if hasattr(embedding, "tobytes") else None
+
+        doc_date = req.document_date or datetime.now().strftime("%Y-%m-%d")
+        conn.execute(
+            """INSERT INTO memories (id, content, category, confidence, source_session, source_agent,
+                       source_chunk_id, document_date, embedding, is_current, version, created_at)
+               VALUES (?, ?, 'fact', 0.7, ?, ?, ?, ?, ?, 1, 1, datetime('now'))""",
+            (mem_id, chunk, req.session_key, req.agent_id, source_id, doc_date, blob),
+        )
+        inserted += 1
+
+    conn.commit()
+    conn.close()
+
+    # Don't rebuild cache on every raw ingest - too expensive with many ingests.
+    # Call POST /api/refresh_cache after bulk ingest, or search auto-refreshes.
+
+    return {"count": inserted, "chunks": len(chunks)}
+
+
+@app.post("/api/refresh_cache")
+async def refresh_cache():
+    """Rebuild the in-memory embedding cache from the database."""
+    global _embed_matrix, _embed_meta, _cache_built_at
+    _embed_matrix, _embed_meta = _build_embedding_cache()
+    _cache_built_at = datetime.now()
+    count = len(_embed_meta) if _embed_meta else 0
+    return {"status": "ok", "cached_memories": count}
+
+
 @app.post("/api/search")
 async def search(req: SearchRequest):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, partial(_search_sync, req))
+
+
+def _search_sync(req: SearchRequest):
     global _embed_matrix, _embed_meta
 
     # Use in-memory cache for current_only searches without as_of_date (fast path)
@@ -262,6 +377,287 @@ async def search(req: SearchRequest):
         for r in results:
             r.pop("source_chunk", None)
     return {"results": results, "count": len(results)}
+
+
+# ── Entity-Aware Search ─────────────────────────────────────────────────────
+
+
+class EntitySearchRequest(BaseModel):
+    query: str
+    top_k: int = 30
+    entity_expand_k: int = 50
+    include_source: bool = False
+    current_only: bool = True
+
+    @field_validator("query")
+    @classmethod
+    def validate_query_length(cls, v):
+        max_len = cfg.get("max_query_length", 1024)
+        if len(v) > max_len:
+            raise ValueError(f"Query exceeds maximum length of {max_len} characters")
+        return v
+
+
+@app.post("/api/search_entities")
+async def search_entities(req: EntitySearchRequest):
+    """Entity-aware search: vector search + entity expansion for cross-session retrieval."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, partial(_entity_search_sync, req))
+
+
+def _entity_search_sync(req: EntitySearchRequest):
+    """
+    Three-phase entity-aware search:
+    1. Standard vector search for initial results
+    2. Extract named entities from content of top results using simple NLP
+    3. Do secondary vector searches for each extracted entity to find cross-session memories
+    4. Also expand via memory_entities join table where available
+    5. Merge, deduplicate, group by entity
+    """
+    import re
+    import sqlite3 as _sqlite3
+
+    # Phase 1: Standard vector search
+    vector_results = _search_sync(
+        SearchRequest(
+            query=req.query,
+            top_k=req.top_k,
+            include_source=req.include_source,
+            current_only=req.current_only,
+        )
+    )
+    vector_memories = vector_results.get("results", [])
+
+    conn = _sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = _sqlite3.Row
+
+    vector_ids = set(m["id"] for m in vector_memories)
+
+    # Phase 2: Extract entities from memory_entities table AND from content via regex
+    entity_counts = {}
+    if vector_ids:
+        placeholders = ",".join("?" for _ in vector_ids)
+        entity_rows = conn.execute(
+            f"SELECT entity_name, COUNT(*) as cnt FROM memory_entities WHERE memory_id IN ({placeholders}) GROUP BY entity_name",
+            list(vector_ids),
+        ).fetchall()
+        entity_counts = {r["entity_name"]: r["cnt"] for r in entity_rows}
+
+    # Extract proper nouns from memory content
+    name_pattern = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b")
+    stop_words = {
+        "the",
+        "this",
+        "that",
+        "they",
+        "their",
+        "there",
+        "when",
+        "what",
+        "where",
+        "which",
+        "while",
+        "with",
+        "would",
+        "will",
+        "some",
+        "about",
+        "after",
+        "before",
+        "between",
+        "each",
+        "every",
+        "first",
+        "last",
+        "most",
+        "next",
+        "other",
+        "user",
+        "memory",
+        "date",
+        "recently",
+        "approximately",
+        "several",
+        "many",
+        "few",
+        "new",
+        "old",
+        "also",
+        "however",
+        "been",
+        "has",
+        "had",
+        "was",
+        "were",
+        "are",
+        "not",
+    }
+    content_entities = {}
+    for m in vector_memories:
+        content = m.get("content", "")
+        for name in name_pattern.findall(content):
+            if name.lower() not in stop_words and len(name) >= 2:
+                content_entities[name] = content_entities.get(name, 0) + 1
+
+    # Direct entity match in query
+    query_lower = req.query.lower()
+    direct_matches = set()
+    for r in conn.execute("SELECT DISTINCT entity_name FROM memory_entities").fetchall():
+        ename = r["entity_name"]
+        if len(ename) > 2 and ename.lower() in query_lower:
+            direct_matches.add(ename)
+
+    # Combine: any entity from join table or content extraction that appears 1+ times
+    # (being less strict - we'll filter noise at the context building stage)
+    found_entities = set(direct_matches)
+    for ename, _cnt in entity_counts.items():
+        found_entities.add(ename)
+    for ename, cnt in content_entities.items():
+        if cnt >= 2:
+            found_entities.add(ename)
+
+    generic_entities = {
+        "user",
+        "AI",
+        "United States",
+        "US",
+        "the user",
+        "they",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    }
+    found_entities -= generic_entities
+
+    # Phase 3: Multi-strategy entity expansion
+    entity_memory_ids = {}  # entity -> set of memory_ids
+
+    # 3a: Expand via memory_entities join table
+    for entity_name in found_entities:
+        rows = conn.execute(
+            """SELECT me.memory_id FROM memory_entities me
+               JOIN memories m ON me.memory_id = m.id
+               WHERE me.entity_name = ? AND m.is_current = 1""",
+            (entity_name,),
+        ).fetchall()
+        if rows:
+            entity_memory_ids[entity_name] = {r["memory_id"] for r in rows}
+
+    # 3b: Content-based expansion: find memories containing entity name in text
+    for entity_name in found_entities:
+        rows = conn.execute(
+            """SELECT id FROM memories
+               WHERE content LIKE ? AND is_current = 1
+               LIMIT 20""",
+            (f"%{entity_name}%",),
+        ).fetchall()
+        if rows:
+            if entity_name not in entity_memory_ids:
+                entity_memory_ids[entity_name] = set()
+            entity_memory_ids[entity_name].update(r["id"] for r in rows)
+
+    # 3c: Secondary vector searches for entities not well covered by text search
+    for entity_name in found_entities:
+        current_count = len(entity_memory_ids.get(entity_name, set()))
+        if current_count < 3:  # Only do vector search if we found few matches
+            sec_results = _search_sync(
+                SearchRequest(
+                    query=entity_name,
+                    top_k=5,
+                    include_source=False,
+                    current_only=True,
+                )
+            )
+            sec_mems = [m for m in sec_results.get("results", []) if m.get("similarity", 0) >= 0.4]
+            if sec_mems:
+                if entity_name not in entity_memory_ids:
+                    entity_memory_ids[entity_name] = set()
+                entity_memory_ids[entity_name].update(m["id"] for m in sec_mems)
+
+    # Collect all expanded memory IDs
+    all_expanded_ids = set()
+    for mids in entity_memory_ids.values():
+        all_expanded_ids.update(mids)
+
+    # Hydrate new memories not in vector results
+    new_ids = all_expanded_ids - vector_ids
+    entity_expanded = []
+    if new_ids:
+        new_ids_list = list(new_ids)[: req.entity_expand_k]
+        placeholders = ",".join("?" for _ in new_ids_list)
+        rows = conn.execute(
+            f"""SELECT m.id, m.content, m.category, m.confidence,
+                       m.document_date, m.event_date, m.source_session,
+                       m.source_agent, m.version, m.is_current
+                FROM memories m
+                WHERE m.id IN ({placeholders})""",
+            new_ids_list,
+        ).fetchall()
+
+        for r in rows:
+            entity_expanded.append(
+                {
+                    "id": r["id"],
+                    "content": r["content"],
+                    "category": r["category"],
+                    "confidence": r["confidence"],
+                    "document_date": r["document_date"],
+                    "event_date": r["event_date"],
+                    "source_session": r["source_session"],
+                    "version": r["version"],
+                    "is_current": bool(r["is_current"]),
+                    "similarity": 0.0,
+                    "source": "entity_expansion",
+                    "relations": [],
+                }
+            )
+
+    # Tag all results with their entities
+    all_memories_map = {}
+    for m in vector_memories:
+        m["source"] = "vector"
+        m["entities"] = []
+        all_memories_map[m["id"]] = m
+    for m in entity_expanded:
+        m["entities"] = []
+        all_memories_map[m["id"]] = m
+
+    for ename, mids in entity_memory_ids.items():
+        for mid in mids:
+            if mid in all_memories_map:
+                all_memories_map[mid]["entities"].append(ename)
+
+    # Merge: vector first, then entity-expanded
+    all_results = vector_memories + entity_expanded
+
+    conn.close()
+
+    return {
+        "results": all_results,
+        "count": len(all_results),
+        "vector_count": len(vector_memories),
+        "entity_expanded_count": len(entity_expanded),
+        "entities_found": sorted(found_entities),
+        "entity_groups": {k: len(v) for k, v in entity_memory_ids.items()},
+    }
 
 
 @app.get("/api/graph")
@@ -472,8 +868,194 @@ async def startup_context(req: StartupContextRequest):
     }
 
 
+# ── Event Aggregation + Search ─────────────────────────────────────────────
+
+AGGREGATE_PARSE_PROMPT = """Parse this question into a structured aggregation intent.
+
+Question: {question}
+
+Return a JSON object with:
+- "operation": one of "count_distinct" (how many different events) or "sum_duration" (total hours/minutes)
+- "event_types": array of event type strings to match (e.g. ["wedding"], ["exercise"], ["art_event"])
+- "subtypes": array of subtype strings if specific (e.g. ["yoga", "jogging"]) or empty array
+- "time_scope": time scope string like "this_year", "last_week", "past_month", or null if no time constraint
+- "user_involvement": filter like "attended", "did", or null for any involvement
+
+Return ONLY a JSON object, no other text."""
+
+
+class AggregateRequest(BaseModel):
+    question: str
+
+
+class SearchEventsRequest(BaseModel):
+    event_type: str | None = None
+    subtype: str | None = None
+    time_range: str | None = None
+    participants: list[str] | None = None
+    limit: int = 20
+
+
+@app.post("/api/aggregate")
+async def aggregate(req: AggregateRequest):
+    """Detect aggregate intent, query event_clusters, return deterministic answer."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, partial(_aggregate_sync, req))
+
+
+def _aggregate_sync(req: AggregateRequest):
+    # Parse question into structured intent via LLM
+    prompt = AGGREGATE_PARSE_PROMPT.format(question=req.question)
+    response = engine._llm_call(prompt)
+    try:
+        text = response.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines)
+        intent = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return {"answer": None, "error": "Could not parse question intent"}
+
+    operation = intent.get("operation", "count_distinct")
+    event_types = intent.get("event_types", [])
+    subtypes = intent.get("subtypes", [])
+    user_involvement = intent.get("user_involvement")
+
+    # Build SQL query against event_clusters
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = sqlite3.Row
+
+    conditions = []
+    params = []
+
+    if event_types:
+        placeholders = ",".join("?" for _ in event_types)
+        conditions.append(f"event_type IN ({placeholders})")
+        params.extend([t.lower() for t in event_types])
+
+    if subtypes:
+        placeholders = ",".join("?" for _ in subtypes)
+        conditions.append(f"subtype IN ({placeholders})")
+        params.extend([s.lower() for s in subtypes])
+
+    if user_involvement:
+        conditions.append("user_involvement = ?")
+        params.append(user_involvement)
+
+    where = " AND ".join(conditions) if conditions else "1=1"
+
+    rows = conn.execute(
+        f"""SELECT id, event_type, subtype, canonical_label, distinct_key,
+                   participants, normalized_date, duration_minutes,
+                   user_involvement, confidence
+            FROM event_clusters WHERE {where}
+            ORDER BY normalized_date DESC""",
+        params,
+    ).fetchall()
+
+    events = [dict(r) for r in rows]
+    conn.close()
+
+    if operation == "count_distinct":
+        answer = len(events)
+    elif operation == "sum_duration":
+        total = sum(e["duration_minutes"] or 0 for e in events)
+        answer = round(total / 60, 2)  # Return in hours
+    else:
+        answer = len(events)
+
+    return {
+        "answer": answer,
+        "operation": operation,
+        "intent": intent,
+        "events": events[:50],
+    }
+
+
+@app.post("/api/search_events")
+async def search_events(req: SearchEventsRequest):
+    """Search event_clusters with optional filters."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, partial(_search_events_sync, req))
+
+
+def _search_events_sync(req: SearchEventsRequest):
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = sqlite3.Row
+
+    conditions = []
+    params = []
+
+    if req.event_type:
+        conditions.append("ec.event_type = ?")
+        params.append(req.event_type.lower())
+
+    if req.subtype:
+        conditions.append("ec.subtype = ?")
+        params.append(req.subtype.lower())
+
+    if req.participants:
+        for p in req.participants:
+            conditions.append("ec.participants LIKE ?")
+            params.append(f"%{p}%")
+
+    where = " AND ".join(conditions) if conditions else "1=1"
+
+    clusters = conn.execute(
+        f"""SELECT ec.id, ec.event_type, ec.subtype, ec.canonical_label,
+                   ec.distinct_key, ec.participants, ec.normalized_date,
+                   ec.duration_minutes, ec.user_involvement, ec.confidence
+            FROM event_clusters ec
+            WHERE {where}
+            ORDER BY ec.normalized_date DESC
+            LIMIT ?""",
+        params + [req.limit],
+    ).fetchall()
+
+    results = []
+    for cluster in clusters:
+        c = dict(cluster)
+        # Get mentions for this cluster
+        mentions = conn.execute(
+            """SELECT em.id, em.summary, em.session_key, em.time_text,
+                      em.normalized_date, em.confidence
+               FROM event_mentions em
+               JOIN event_cluster_members ecm ON em.id = ecm.event_id
+               WHERE ecm.cluster_id = ?""",
+            (c["id"],),
+        ).fetchall()
+        c["mentions"] = [dict(m) for m in mentions]
+
+        # Get linked memories
+        if mentions:
+            mention_ids = [m["id"] for m in mentions]
+            placeholders = ",".join("?" for _ in mention_ids)
+            memories = conn.execute(
+                f"""SELECT DISTINCT mem.id, mem.content, mem.category
+                    FROM memories mem
+                    JOIN event_mention_memories emm ON mem.id = emm.memory_id
+                    WHERE emm.event_id IN ({placeholders})""",
+                mention_ids,
+            ).fetchall()
+            c["linked_memories"] = [dict(m) for m in memories]
+        else:
+            c["linked_memories"] = []
+
+        results.append(c)
+
+    conn.close()
+    return {"results": results, "count": len(results)}
+
+
 @app.post("/api/cache/refresh")
-async def refresh_cache():
+async def refresh_cache_v2():
     """Rebuild the in-memory embedding cache after new ingestions."""
     global _embed_matrix, _embed_meta, _cache_built_at
     _embed_matrix, _embed_meta = _build_embedding_cache()

@@ -277,11 +277,12 @@ def run_ingest_cycle(state: dict, dry_run: bool = False, verbose: bool = False) 
                 continue
 
             try:
+                doc_date = datetime.now().isoformat()[:10]
                 memories = engine.ingest(
                     segment,
                     session_key=session_key,
                     agent_id=agent_id,
-                    document_date=datetime.now().isoformat()[:10],
+                    document_date=doc_date,
                 )
                 n = len(memories)
                 total_new += n
@@ -289,6 +290,39 @@ def run_ingest_cycle(state: dict, dry_run: bool = False, verbose: bool = False) 
                     for m in memories:
                         cat = m.get("category", "?")
                         print(f"    + [{cat}] {m['content'][:80]}", file=sys.stderr)
+
+                # Extract events from the same segment
+                try:
+                    # Find the chunk_id from the first memory (all share same chunk)
+                    chunk_id = None
+                    if memories:
+                        conn = engine._conn()
+                        try:
+                            row = conn.execute(
+                                "SELECT source_chunk_id FROM memories WHERE id = ?",
+                                (memories[0]["id"],),
+                            ).fetchone()
+                            if row:
+                                chunk_id = row["source_chunk_id"]
+                        finally:
+                            conn.close()
+                    events = engine.extract_events(
+                        segment,
+                        session_key=session_key,
+                        chunk_id=chunk_id,
+                        document_date=doc_date,
+                    )
+                    if verbose and events:
+                        for ev in events:
+                            print(
+                                f"    * [{ev['event_type']}] {ev['summary'][:80]}",
+                                file=sys.stderr,
+                            )
+                except Exception as e:
+                    print(
+                        f"  ! Event extraction error ({agent_id}/{session_id[:8]}): {e}",
+                        file=sys.stderr,
+                    )
             except Exception as e:
                 print(f"  ! Ingest error ({agent_id}/{session_id[:8]}): {e}", file=sys.stderr)
 
