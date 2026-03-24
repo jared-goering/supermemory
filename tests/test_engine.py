@@ -392,6 +392,33 @@ class TestMemoryEngine(unittest.TestCase):
         history = self.engine.get_history("Acme Corp")
         self.assertGreater(len(history), 0)
 
+    def test_source_chunk_normalization(self):
+        """Test that source text is stored once in source_chunks, not per-memory."""
+        self.engine._llm_call = make_first_ingest_llm()
+        self.engine.ingest(CONVERSATION_1, "s1", "kit", "2025-01-15")
+
+        # Should have 4 memories but only 1 source chunk
+        conn = self.engine._conn()
+        chunk_count = conn.execute("SELECT COUNT(*) as c FROM source_chunks").fetchone()["c"]
+        self.assertEqual(chunk_count, 1)
+
+        # All memories should reference the same chunk
+        chunk_ids = conn.execute(
+            "SELECT DISTINCT source_chunk_id FROM memories WHERE source_chunk_id IS NOT NULL"
+        ).fetchall()
+        self.assertEqual(len(chunk_ids), 1)
+
+        # The chunk content should be the original text
+        chunk = conn.execute("SELECT content FROM source_chunks").fetchone()
+        self.assertEqual(chunk["content"], CONVERSATION_1)
+        conn.close()
+
+        # Search should still return source_chunk via JOIN
+        results = self.engine.search("Alice address")
+        address_results = [r for r in results if "742 Evergreen" in r["content"]]
+        self.assertTrue(len(address_results) > 0)
+        self.assertEqual(address_results[0]["source_chunk"], CONVERSATION_1)
+
     def test_entity_history_uses_join_table(self):
         """Test that get_history uses indexed join table, not LIKE scan."""
         self.engine._llm_call = make_first_ingest_llm()

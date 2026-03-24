@@ -29,6 +29,15 @@ from supermemory.config import get_config
 # ── Schema ───────────────────────────────────────────────────────────────────
 
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS source_chunks (
+    id TEXT PRIMARY KEY,
+    content TEXT NOT NULL,
+    session_key TEXT,
+    agent_id TEXT,
+    document_date TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY,
     content TEXT NOT NULL,
@@ -38,13 +47,14 @@ CREATE TABLE IF NOT EXISTS memories (
     event_date TEXT,
     source_session TEXT,
     source_agent TEXT,
-    source_chunk TEXT,
+    source_chunk_id TEXT,
     version INTEGER DEFAULT 1,
     is_current BOOLEAN DEFAULT 1,
     superseded_by TEXT,
     embedding BLOB,
     created_at TEXT DEFAULT (datetime('now')),
-    updated_at TEXT DEFAULT (datetime('now'))
+    updated_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (source_chunk_id) REFERENCES source_chunks(id)
 );
 
 CREATE TABLE IF NOT EXISTS memory_relations (
@@ -82,12 +92,15 @@ CREATE TABLE IF NOT EXISTS entity_aliases (
 CREATE INDEX IF NOT EXISTS idx_memories_current ON memories(is_current);
 CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
 CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(source_session);
+CREATE INDEX IF NOT EXISTS idx_memories_agent ON memories(source_agent);
+CREATE INDEX IF NOT EXISTS idx_memories_chunk ON memories(source_chunk_id);
 CREATE INDEX IF NOT EXISTS idx_relations_from ON memory_relations(from_memory);
 CREATE INDEX IF NOT EXISTS idx_relations_to ON memory_relations(to_memory);
 CREATE INDEX IF NOT EXISTS idx_profiles_entity ON profiles(entity_name);
 CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity_name);
 CREATE INDEX IF NOT EXISTS idx_memory_entities_memory ON memory_entities(memory_id);
 CREATE INDEX IF NOT EXISTS idx_entity_aliases_canonical ON entity_aliases(canonical);
+CREATE INDEX IF NOT EXISTS idx_source_chunks_session ON source_chunks(session_key);
 """
 
 # ── LLM Prompts ──────────────────────────────────────────────────────────────
@@ -169,6 +182,13 @@ class MemoryEngine:
             conn.execute("PRAGMA busy_timeout=30000")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.executescript(SCHEMA_SQL)
+            # Migration: add source_chunk_id column if only old source_chunk exists
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(memories)").fetchall()}
+            if "source_chunk_id" not in cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN source_chunk_id TEXT")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_chunk ON memories(source_chunk_id)"
+                )
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30)
@@ -410,11 +430,20 @@ class MemoryEngine:
             # Single write transaction for all inserts + entity links
             if insert_batch:
                 conn.execute("BEGIN IMMEDIATE")
+
+                # Store source chunk once in normalized table
+                chunk_id = str(uuid.uuid4())
+                conn.execute(
+                    "INSERT INTO source_chunks (id, content, session_key, agent_id, document_date) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (chunk_id, text, session_key, agent_id, document_date),
+                )
+
                 for mem_id, mem_data, embedding in insert_batch:
                     conn.execute(
                         """INSERT INTO memories
                            (id, content, category, confidence, document_date, event_date,
-                            source_session, source_agent, source_chunk, embedding)
+                            source_session, source_agent, source_chunk_id, embedding)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             mem_id,
@@ -425,7 +454,7 @@ class MemoryEngine:
                             mem_data.get("event_date"),
                             session_key,
                             agent_id,
-                            text,
+                            chunk_id,
                             self._vec_to_blob(embedding),
                         ),
                     )
@@ -722,10 +751,13 @@ class MemoryEngine:
             # ── Phase 2: Hydrate full metadata for top-k only ────────────
             placeholders = ",".join("?" for _ in top_ids)
             full_rows = conn.execute(
-                f"""SELECT id, content, category, confidence, document_date, event_date,
-                          source_session, source_agent, source_chunk, version,
-                          is_current, superseded_by
-                   FROM memories WHERE id IN ({placeholders})""",
+                f"""SELECT m.id, m.content, m.category, m.confidence, m.document_date,
+                          m.event_date, m.source_session, m.source_agent,
+                          m.source_chunk_id, m.version, m.is_current, m.superseded_by,
+                          sc.content as source_chunk
+                   FROM memories m
+                   LEFT JOIN source_chunks sc ON m.source_chunk_id = sc.id
+                   WHERE m.id IN ({placeholders})""",
                 top_ids,
             ).fetchall()
 

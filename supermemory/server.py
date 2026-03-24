@@ -102,8 +102,9 @@ async def health():
 
     conn = sqlite3.connect(DB_PATH, timeout=10)
     count = conn.execute("SELECT COUNT(*) FROM memories WHERE is_current = 1").fetchone()[0]
+    chunks = conn.execute("SELECT COUNT(*) FROM source_chunks").fetchone()[0]
     conn.close()
-    return {"status": "ok", "memories": count, "version": "0.1.0"}
+    return {"status": "ok", "memories": count, "source_chunks": chunks, "version": "0.2.0"}
 
 
 class IngestRequest(BaseModel):
