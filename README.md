@@ -63,7 +63,9 @@ Text → Extract atomic facts → Detect relations to existing memories → Stor
 
 1. **Extract** - LLM splits text into atomic facts, each with a category (decision, event, person, insight, etc.), confidence score, entity tags, and event date
 2. **Relate** - New facts are compared to existing memories via embedding similarity. An LLM classifies the relationship: `updates`, `extends`, `contradicts`, `supports`, or `derives`
-3. **Store** - Facts go into SQLite with their embedding (384-dim float32 BLOB). Superseded memories are marked but never deleted
+3. **Store** - Facts go into SQLite with their embedding (384-dim float32 BLOB). Entities are indexed in a join table for fast lookup. Source text is stored once in a normalized chunks table. Superseded memories are marked but never deleted
+
+LLM calls (steps 1-2) run outside of the database write transaction, so ingestion never locks the DB while waiting on an API response.
 
 ### Search (zero LLM calls)
 
@@ -71,7 +73,7 @@ Text → Extract atomic facts → Detect relations to existing memories → Stor
 Query → Embed locally → Cosine similarity (matrix mul) → Filter by time/version → Return with relations
 ```
 
-All search happens on-device. A single matrix-vector multiply scores every memory. Filtering by time window, version status, or entity is instant.
+All search happens on-device. Ranking uses ID and embedding vectors only (no full-record scan), then hydrates just the top-k results with metadata. Filtering by time window, version status, or entity is instant. Source text is only loaded when explicitly requested (`include_source: true`).
 
 ### Architecture
 
@@ -83,19 +85,29 @@ All search happens on-device. A single matrix-vector multiply scores every memor
 │                 atomic facts      UPDATE/EXTEND    SQLite │
 │                 + categories      CONTRADICT/etc.  + BLOB │
 │                 + entity tags                    embeddings│
+│                                                          │
+│  LLM calls run OUTSIDE write transactions (no DB lock    │
+│  contention). Source text stored once per batch in a      │
+│  normalized source_chunks table (98% storage reduction).  │
+│  Entities extracted into a join table for indexed lookup. │
 └──────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────┐
 │                 Search Pipeline (no LLM)                  │
 │                                                          │
-│  Query ──► Embed locally ──► Cosine sim ──► Time filter  │
-│            sentence-        matrix mul     + version      │
-│            transformers                    + expand rels  │
+│  Query ──► Embed locally ──► Rank by ID+embedding only   │
+│            sentence-        (no full record scan)         │
+│            transformers          │                        │
+│                                  ▼                       │
+│                           Hydrate top-k ──► Time filter  │
+│                           (lazy-load)      + version     │
+│                                            + expand rels │
 └──────────────────────────────────────────────────────────┘
 
-Storage: SQLite (memories, relations, profiles) — single file, WAL mode
+Storage: SQLite (memories, relations, profiles, source_chunks, entities) — single file, WAL mode
 Embeddings: all-MiniLM-L6-v2 (384-dim, local, free)
 LLM: Any provider via litellm (OpenAI, Anthropic, Ollama, etc.)
+Security: bind 127.0.0.1 by default, optional API key auth, locked CORS origins
 ```
 
 ## CLI
@@ -138,15 +150,46 @@ curl -X POST http://localhost:8642/api/search \
   -d '{
     "query": "Where does Alice live?",
     "top_k": 10,
-    "current_only": true
+    "current_only": true,
+    "include_source": false
   }'
+```
+
+The `include_source` parameter controls whether the original source text is returned with results. Defaults to `false` to keep responses lean. Set to `true` when you need full provenance.
+
+### Authentication
+
+If you set `SUPERMEMORY_API_KEY`, all requests must include an `X-API-Key` header:
+
+```bash
+curl -X POST http://localhost:8642/api/search \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-key" \
+  -d '{"query": "Alice"}'
+```
+
+Without the key configured, the API runs open (fine for localhost).
+
+### Entity management
+
+```bash
+# List all known entities
+curl http://localhost:8642/api/entities
+
+# Get details for a specific entity (memories, profile, aliases)
+curl http://localhost:8642/api/entity/Alice
+
+# Merge duplicate entities ("Al" is an alias for "Alice")
+curl -X POST http://localhost:8642/api/entity/Alice/merge \
+  -H "Content-Type: application/json" \
+  -d '{"alias": "Al"}'
 ```
 
 ### All endpoints
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/api/health` | Health check (memory count, version) |
+| `GET` | `/api/health` | Health check (memory count, source chunks, version) |
 | `POST` | `/api/ingest` | Extract and store memories from text |
 | `POST` | `/api/search` | Semantic search with filters |
 | `POST` | `/api/recall` | Fast recall using cached embeddings |
@@ -156,6 +199,8 @@ curl -X POST http://localhost:8642/api/search \
 | `GET` | `/api/history/{entity}` | Entity version history |
 | `GET` | `/api/profile/{entity}` | Auto-built entity profile |
 | `GET` | `/api/entities` | List all known entities |
+| `GET` | `/api/entity/{name}` | Entity details (memories, profile, aliases) |
+| `POST` | `/api/entity/{name}/merge` | Merge entity aliases |
 | `POST` | `/api/cache/refresh` | Rebuild embedding cache |
 
 ## Multi-agent memory
@@ -197,7 +242,11 @@ embedding_dim: 384
 
 # API server
 api_port: 8642
-api_host: 0.0.0.0
+api_host: 127.0.0.1          # localhost only by default (safe)
+
+# Security
+api_key: ""                   # Set to require X-API-Key header on all requests
+cors_origins: "http://localhost:3333"  # Comma-separated allowed origins
 
 # Dedup threshold (cosine similarity, 0.0-1.0)
 dedup_threshold: 0.97
@@ -216,15 +265,18 @@ session_scan_dirs:
 
 ### Environment variables
 
-| Variable | Default |
-|----------|---------|
-| `SUPERMEMORY_DB_PATH` | `~/.supermemory/memory.db` |
-| `SUPERMEMORY_MODEL` | `anthropic/claude-haiku-4-5` |
-| `SUPERMEMORY_EMBEDDING_PROVIDER` | `local` |
-| `SUPERMEMORY_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` |
-| `SUPERMEMORY_EMBEDDING_DIM` | `384` |
-| `SUPERMEMORY_API_PORT` | `8642` |
-| `SUPERMEMORY_DEDUP_THRESHOLD` | `0.97` |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SUPERMEMORY_DB_PATH` | `~/.supermemory/memory.db` | SQLite database location |
+| `SUPERMEMORY_MODEL` | `anthropic/claude-haiku-4-5` | LLM for fact extraction |
+| `SUPERMEMORY_EMBEDDING_PROVIDER` | `local` | `local` or `litellm` |
+| `SUPERMEMORY_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Embedding model name |
+| `SUPERMEMORY_EMBEDDING_DIM` | `384` | Embedding vector dimensions |
+| `SUPERMEMORY_API_PORT` | `8642` | API server port |
+| `SUPERMEMORY_API_HOST` | `127.0.0.1` | Bind address (use `0.0.0.0` to expose externally) |
+| `SUPERMEMORY_API_KEY` | *(none)* | Optional API key for all requests |
+| `SUPERMEMORY_CORS_ORIGINS` | `*` | Comma-separated allowed CORS origins |
+| `SUPERMEMORY_DEDUP_THRESHOLD` | `0.97` | Cosine similarity threshold for dedup |
 
 ## Visualization
 
@@ -254,7 +306,7 @@ Measured on Apple M4 (Mac mini, 16GB):
 | Ingest (per text block) | 2-4s (LLM-bound) |
 | Startup recall (multi-query) | <100ms |
 
-Database tested with 9,000+ memories, 10,000+ relations, 1,000+ entity profiles. SQLite with WAL mode handles concurrent reads from multiple agents without issues.
+Database tested with 10,000+ memories, 11,000+ relations, 1,000+ entity profiles. SQLite with WAL mode handles concurrent reads from multiple agents without issues. Source text is normalized into a deduplicated chunks table, reducing storage by ~98% compared to per-memory duplication.
 
 ## Development
 
