@@ -318,15 +318,44 @@ async def profile(entity_name: str):
 
 
 @app.get("/api/entities")
-async def entities():
-    """Return unique entity names."""
-    import sqlite3
+async def entities(min_mentions: int = 1):
+    """Return entities with mention counts from the join table, with profile status."""
+    entity_list = engine.list_entities(min_mentions=min_mentions)
 
-    conn = sqlite3.connect(DB_PATH)
-    # entity_name may not exist as column; extract from content
-    rows = conn.execute("SELECT DISTINCT entity_name FROM profiles ORDER BY entity_name").fetchall()
+    # Enrich with profile existence check
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    profile_names = {r[0] for r in conn.execute("SELECT entity_name FROM profiles").fetchall()}
     conn.close()
-    return {"entities": [r[0] for r in rows]}
+
+    for e in entity_list:
+        e["has_profile"] = e["entity_name"] in profile_names
+
+    return {"entities": entity_list, "count": len(entity_list)}
+
+
+class MergeRequest(BaseModel):
+    old_name: str
+    new_name: str
+
+
+@app.post("/api/entities/merge")
+async def merge_entities(req: MergeRequest):
+    """Merge old_name into new_name: updates join table + adds alias."""
+    engine.merge_entities(req.old_name, req.new_name)
+    return {"status": "ok", "merged": req.old_name, "into": req.new_name}
+
+
+class AliasRequest(BaseModel):
+    alias: str
+    canonical: str
+
+
+@app.post("/api/entities/alias")
+async def add_alias(req: AliasRequest):
+    """Register an alias for an entity name."""
+    engine.add_entity_alias(req.alias, req.canonical)
+    return {"status": "ok", "alias": req.alias, "canonical": req.canonical}
 
 
 class RecallRequest(BaseModel):

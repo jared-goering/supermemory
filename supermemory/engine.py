@@ -66,12 +66,28 @@ CREATE TABLE IF NOT EXISTS profiles (
     updated_at TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS memory_entities (
+    memory_id TEXT NOT NULL,
+    entity_name TEXT NOT NULL,
+    entity_type TEXT,
+    FOREIGN KEY (memory_id) REFERENCES memories(id),
+    PRIMARY KEY (memory_id, entity_name)
+);
+
+CREATE TABLE IF NOT EXISTS entity_aliases (
+    alias TEXT PRIMARY KEY,
+    canonical TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_memories_current ON memories(is_current);
 CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
 CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(source_session);
 CREATE INDEX IF NOT EXISTS idx_relations_from ON memory_relations(from_memory);
 CREATE INDEX IF NOT EXISTS idx_relations_to ON memory_relations(to_memory);
 CREATE INDEX IF NOT EXISTS idx_profiles_entity ON profiles(entity_name);
+CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity_name);
+CREATE INDEX IF NOT EXISTS idx_memory_entities_memory ON memory_entities(memory_id);
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_canonical ON entity_aliases(canonical);
 """
 
 # ── LLM Prompts ──────────────────────────────────────────────────────────────
@@ -222,6 +238,100 @@ class MemoryEngine:
             text = "\n".join(lines)
         return json.loads(text)
 
+    # ── Entity helpers ─────────────────────────────────────────────────
+
+    def _resolve_entity(self, conn: sqlite3.Connection, name: str) -> str:
+        """Resolve an entity name through aliases to its canonical form."""
+        row = conn.execute(
+            "SELECT canonical FROM entity_aliases WHERE alias = ?",
+            (name.lower().strip(),),
+        ).fetchone()
+        return row["canonical"] if row else name.strip()
+
+    def _store_entities(self, conn: sqlite3.Connection, memory_id: str, entities: list[dict | str]):
+        """Store entity-memory links in the join table."""
+        for entity in entities:
+            if isinstance(entity, dict):
+                name = entity.get("name", "")
+                etype = entity.get("type")
+            else:
+                name = str(entity)
+                etype = None
+
+            if not name:
+                continue
+
+            canonical = self._resolve_entity(conn, name)
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_entities (memory_id, entity_name, entity_type) "
+                "VALUES (?, ?, ?)",
+                (memory_id, canonical, etype),
+            )
+
+    def add_entity_alias(self, alias: str, canonical: str):
+        """Register an alias that maps to a canonical entity name."""
+        conn = self._conn()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO entity_aliases (alias, canonical) VALUES (?, ?)",
+                (alias.lower().strip(), canonical.strip()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def merge_entities(self, old_name: str, new_name: str):
+        """Merge old_name into new_name: update join table + add alias."""
+        conn = self._conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # Update all memory_entities rows
+            conn.execute(
+                "UPDATE memory_entities SET entity_name = ? WHERE entity_name = ?",
+                (new_name.strip(), old_name.strip()),
+            )
+            # Add alias mapping
+            conn.execute(
+                "INSERT OR REPLACE INTO entity_aliases (alias, canonical) VALUES (?, ?)",
+                (old_name.lower().strip(), new_name.strip()),
+            )
+            # Update profile if exists
+            conn.execute(
+                "UPDATE profiles SET entity_name = ? WHERE entity_name = ?",
+                (new_name.strip(), old_name.strip()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_entities(self, min_mentions: int = 1) -> list[dict]:
+        """List all entities with mention counts."""
+        conn = self._conn()
+        try:
+            rows = conn.execute(
+                """SELECT me.entity_name, me.entity_type, COUNT(*) as mention_count,
+                          (SELECT COUNT(*) FROM memory_entities me2
+                           JOIN memories m ON me2.memory_id = m.id
+                           WHERE me2.entity_name = me.entity_name AND m.is_current = 1
+                          ) as current_mentions
+                   FROM memory_entities me
+                   GROUP BY me.entity_name
+                   HAVING COUNT(*) >= ?
+                   ORDER BY mention_count DESC""",
+                (min_mentions,),
+            ).fetchall()
+            return [
+                {
+                    "entity_name": r["entity_name"],
+                    "entity_type": r["entity_type"],
+                    "mention_count": r["mention_count"],
+                    "current_mentions": r["current_mentions"],
+                }
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
     # ── Ingest ───────────────────────────────────────────────────────────
 
     def ingest(
@@ -297,7 +407,7 @@ class MemoryEngine:
                 mem_id = str(uuid.uuid4())
                 insert_batch.append((mem_id, mem_data, embedding))
 
-            # Single write transaction for all inserts
+            # Single write transaction for all inserts + entity links
             if insert_batch:
                 conn.execute("BEGIN IMMEDIATE")
                 for mem_id, mem_data, embedding in insert_batch:
@@ -319,13 +429,17 @@ class MemoryEngine:
                             self._vec_to_blob(embedding),
                         ),
                     )
+                    # Store entity-memory links
+                    entities = mem_data.get("entities", [])
+                    self._store_entities(conn, mem_id, entities)
+
                     created_memories.append(
                         {
                             "id": mem_id,
                             "content": mem_data["content"],
                             "category": mem_data.get("category"),
                             "confidence": mem_data.get("confidence", 1.0),
-                            "entities": mem_data.get("entities", []),
+                            "entities": entities,
                             "embedding": embedding,
                         }
                     )
@@ -451,14 +565,24 @@ class MemoryEngine:
 
     def _update_profile_safe(self, entity_name: str):
         """Update profile with LLM call outside the DB transaction."""
-        # Phase A: Read memories (short read)
+        # Phase A: Read memories via indexed join (no LIKE scan)
         conn = self._conn()
         try:
+            canonical = self._resolve_entity(conn, entity_name)
             rows = conn.execute(
-                "SELECT content, category, confidence, document_date "
-                "FROM memories WHERE is_current = 1 AND content LIKE ?",
-                (f"%{entity_name}%",),
+                """SELECT m.content, m.category, m.confidence, m.document_date
+                   FROM memories m
+                   JOIN memory_entities me ON m.id = me.memory_id
+                   WHERE me.entity_name = ? AND m.is_current = 1""",
+                (canonical,),
             ).fetchall()
+            # Fallback to LIKE scan if join table not yet populated for this entity
+            if not rows:
+                rows = conn.execute(
+                    "SELECT content, category, confidence, document_date "
+                    "FROM memories WHERE is_current = 1 AND content LIKE ?",
+                    (f"%{canonical}%",),
+                ).fetchall()
         finally:
             conn.close()
 
@@ -661,14 +785,27 @@ class MemoryEngine:
     def get_history(self, entity_name: str) -> list[dict]:
         """Return version chain for all memories mentioning an entity."""
         with self._conn() as conn:
+            canonical = self._resolve_entity(conn, entity_name)
+            # Use indexed join table first
             rows = conn.execute(
-                """SELECT id, content, category, confidence, document_date, event_date,
-                          version, is_current, superseded_by, created_at
-                   FROM memories
-                   WHERE content LIKE ?
-                   ORDER BY document_date ASC, created_at ASC""",
-                (f"%{entity_name}%",),
+                """SELECT m.id, m.content, m.category, m.confidence, m.document_date,
+                          m.event_date, m.version, m.is_current, m.superseded_by, m.created_at
+                   FROM memories m
+                   JOIN memory_entities me ON m.id = me.memory_id
+                   WHERE me.entity_name = ?
+                   ORDER BY m.document_date ASC, m.created_at ASC""",
+                (canonical,),
             ).fetchall()
+            # Fallback to LIKE if join table not populated
+            if not rows:
+                rows = conn.execute(
+                    """SELECT id, content, category, confidence, document_date, event_date,
+                              version, is_current, superseded_by, created_at
+                       FROM memories
+                       WHERE content LIKE ?
+                       ORDER BY document_date ASC, created_at ASC""",
+                    (f"%{canonical}%",),
+                ).fetchall()
 
             return [
                 {

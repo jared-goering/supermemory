@@ -346,6 +346,65 @@ class TestMemoryEngine(unittest.TestCase):
         self.assertGreater(len(relations), 0)
         self.assertEqual(relations[0]["relation"], "updates")
 
+    def test_entity_join_table(self):
+        """Test that entities are stored in the join table during ingest."""
+        self.engine._llm_call = make_first_ingest_llm()
+        self.engine.ingest(CONVERSATION_1, "s1", "kit", "2025-01-15")
+
+        # Should have entity entries
+        entities = self.engine.list_entities()
+        entity_names = [e["entity_name"] for e in entities]
+        self.assertIn("Alice", entity_names)
+        self.assertIn("Acme Corp", entity_names)
+
+        # Alice should have 4 mentions (all 4 memories mention Alice)
+        alice = [e for e in entities if e["entity_name"] == "Alice"][0]
+        self.assertEqual(alice["mention_count"], 4)
+
+        # Acme Corp should have 1 mention
+        acme = [e for e in entities if e["entity_name"] == "Acme Corp"][0]
+        self.assertEqual(acme["mention_count"], 1)
+
+    def test_entity_alias_and_merge(self):
+        """Test entity alias resolution and merge."""
+        self.engine._llm_call = make_first_ingest_llm()
+        self.engine.ingest(CONVERSATION_1, "s1", "kit", "2025-01-15")
+
+        # Add an alias
+        self.engine.add_entity_alias("alice smith", "Alice")
+
+        # Test resolution
+        conn = self.engine._conn()
+        resolved = self.engine._resolve_entity(conn, "alice smith")
+        conn.close()
+        self.assertEqual(resolved, "Alice")
+
+        # Test merge: rename "Acme Corp" to "ACME Corporation"
+        self.engine.merge_entities("Acme Corp", "ACME Corporation")
+
+        # After merge, list should show ACME Corporation, not Acme Corp
+        entities = self.engine.list_entities()
+        entity_names = [e["entity_name"] for e in entities]
+        self.assertIn("ACME Corporation", entity_names)
+        self.assertNotIn("Acme Corp", entity_names)
+
+        # History lookup with old name should still work via alias
+        history = self.engine.get_history("Acme Corp")
+        self.assertGreater(len(history), 0)
+
+    def test_entity_history_uses_join_table(self):
+        """Test that get_history uses indexed join table, not LIKE scan."""
+        self.engine._llm_call = make_first_ingest_llm()
+        self.engine.ingest(CONVERSATION_1, "s1", "kit", "2025-01-15")
+
+        # History via join table
+        history = self.engine.get_history("Alice")
+        self.assertEqual(len(history), 4)
+
+        # All should contain "Alice"
+        for entry in history:
+            self.assertIn("Alice", entry["content"])
+
 
 if __name__ == "__main__":
     unittest.main()
