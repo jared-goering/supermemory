@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-03-23
+
+### Fixed
+- **Dedup FK violation:** Dedup now deletes `memory_entities` rows before memories (prevents foreign key constraint errors)
+- **Fresh install crash:** Engine creates parent directories for DB path on init (`os.makedirs`)
+- **Missing sentence-transformers:** Clear `ImportError` with install instructions instead of cryptic `ModuleNotFoundError`
+- **Profile alias inconsistency:** `get_profile()` and `_update_profile_safe()` now resolve aliases to canonical names
+- **Entity merge PK collision:** Uses `INSERT OR IGNORE` + `DELETE` pattern to avoid unique constraint violations when merging entities that share memories
+- **Cached search ignores `include_source`:** In-memory cache path now hydrates source chunks from `source_chunks` table when requested
+- **Phantom `agent_id` parameter:** Removed unused `agent_id` from recall endpoint; made optional in startup-context
+- **`__version__` mismatch:** `supermemory/__init__.py` now matches `pyproject.toml`
+
+### Changed
+- Research background section added to README with benchmark attribution
+
 ## [0.2.0] - 2026-03-23
 
 ### Added

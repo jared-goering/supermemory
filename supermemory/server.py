@@ -105,7 +105,7 @@ async def health():
     count = conn.execute("SELECT COUNT(*) FROM memories WHERE is_current = 1").fetchone()[0]
     chunks = conn.execute("SELECT COUNT(*) FROM source_chunks").fetchone()[0]
     conn.close()
-    return {"status": "ok", "memories": count, "source_chunks": chunks, "version": "0.2.0"}
+    return {"status": "ok", "memories": count, "source_chunks": chunks, "version": "0.2.1"}
 
 
 class IngestRequest(BaseModel):

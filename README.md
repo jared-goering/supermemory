@@ -35,6 +35,14 @@ The result: your agent doesn't just remember *what* was said. It knows what chan
 | Entity profiles (auto-built) | ✅ | ✅ | ✅ | ❌ |
 | No cloud account required | ✅ | ❌ | ❌ | ✅ |
 
+### Research background
+
+The architectural choices in Supermemory are grounded in [Supermemory.ai's research](https://supermemory.ai/research/), which demonstrated that atomic fact extraction + relational versioning + temporal grounding achieves **85.2% on LongMemEval_s** (Gemini 3 Pro) vs **71.2% for Zep** and **60.2% for naive full-context retrieval** with gpt-4o. That's a 14.6-point improvement over the next-best memory system and a 25-point gap over stuffing everything into context.
+
+The key insight: searching over clean atomic memories (high signal, low noise) and then injecting original source chunks for detail dramatically outperforms searching over raw conversation text. Coupling memories with temporal metadata and relations solves the temporal reasoning and knowledge-update categories where vector-store approaches historically fail.
+
+We implement the same core innovations locally with SQLite and on-device embeddings, trading their cloud infrastructure for zero-dependency portability.
+
 **Relational versioning** means when you tell your agent "I moved from Seattle to Portland," it doesn't just add a new fact. It creates an UPDATE relation linking the new memory to the old one, marks the old memory as superseded, and preserves the full history. You can still query "where did I live in January?" and get the right answer.
 
 **Temporal grounding** separates *when something was recorded* from *when it happened*. "Last Tuesday's meeting was cancelled" stores the event date as last Tuesday, not today. This makes time-based queries actually work.

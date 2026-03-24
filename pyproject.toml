@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openclaw-supermemory"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local-first AI memory engine with relational versioning and temporal grounding"
 readme = "README.md"
 license = {text = "MIT"}

@@ -8,5 +8,5 @@ semantic search, and relationship tracking.
 from .config import get_config, load_config
 from .engine import MemoryEngine
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __all__ = ["MemoryEngine", "load_config", "get_config"]
