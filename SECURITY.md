@@ -26,7 +26,12 @@ Supermemory stores potentially sensitive data (memories extracted from conversat
 
 | Version | Supported |
 |---------|-----------|
+| 0.2.x   | Yes       |
 | 0.1.x   | Yes       |
+
+## Known Supply Chain Risks
+
+**litellm (dependency):** On 2026-03-24, litellm versions 1.82.7 and 1.82.8 were compromised via a supply chain attack (TeamPCP/Trivy CI/CD compromise). These versions exfiltrate credentials, SSH keys, and environment variables. Our pyproject.toml explicitly excludes these versions. If you installed supermemory between 2026-03-24 10:52 UTC and the PyPI yank (~20:15 UTC), verify your litellm version: `pip show litellm`. Any version other than 1.82.7 or 1.82.8 is safe.
 
 ## Design Principles
 
