@@ -12,25 +12,25 @@
 
 Analysis & Experiment Design
 
-Current failure modes  
-1. High recall / very low precision → LLM flooded with irrelevant memories; can’t isolate the needed fact.  
-2. Preferences & multi-session questions fail → either facts not surfaced (preference extraction) or scattered across sessions without salience boosting.  
+Current failure modes
+1. High recall / very low precision → LLM flooded with irrelevant memories; can’t isolate the needed fact.
+2. Preferences & multi-session questions fail → either facts not surfaced (preference extraction) or scattered across sessions without salience boosting.
 3. Temporal questions fail → recency/order not emphasised during retrieval or reasoning.
 
-Key levers  
-• Retrieval precision: top_k, similarity_threshold, rerank_strategy  
-• Context focus: max_context_memories  
-• Answer reasoning style: answer_strategy tuned to task type  
+Key levers
+• Retrieval precision: top_k, similarity_threshold, rerank_strategy
+• Context focus: max_context_memories
+• Answer reasoning style: answer_strategy tuned to task type
 • Temporal weighting to push the newest / temporally-tagged memories upward
 
-Hypotheses  
-1. Adding entity_boost reranking PLUS a mild similarity filter (0.3-0.4) will cut noise while preserving recall, improving single-session-user, preference, and multi-session questions.  
-2. Some wrong answers stem from too much context, not too little. A minimalist retrieval (top_k=5, no rerank, no threshold) will diagnose whether the model can answer when noise is minimal; if accuracy drops, recall is the bigger issue.  
+Hypotheses
+1. Adding entity_boost reranking PLUS a mild similarity filter (0.3-0.4) will cut noise while preserving recall, improving single-session-user, preference, and multi-session questions.
+2. Some wrong answers stem from too much context, not too little. A minimalist retrieval (top_k=5, no rerank, no threshold) will diagnose whether the model can answer when noise is minimal; if accuracy drops, recall is the bigger issue.
 3. Temporal-recency reranking with a strong temporal weight and a temporal-narrative answer prompt will improve temporal-reasoning and knowledge-update categories, even at very large top_k (breadth first, then aggressive rerank).
 
 Experiments
-1. Strong baseline: balanced recall/precision using entity boost + similarity filter; keep context manageable; CoT structured prompting.  
-2. Diagnostic: tiny top_k, no rerank, concise answer; isolates effect of retrieval size.  
+1. Strong baseline: balanced recall/precision using entity boost + similarity filter; keep context manageable; CoT structured prompting.
+2. Diagnostic: tiny top_k, no rerank, concise answer; isolates effect of retrieval size.
 3. Aggressive/creative: very large retrieval, heavy temporal recency rerank, narrative temporal reasoning.
 
 ```json
@@ -82,4 +82,3 @@ Experiments
 - Exp 2: 22.22% (temporal_recency, temporal_narrative)
 
 Best overall: 33.33%
-

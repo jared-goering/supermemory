@@ -62,6 +62,7 @@ supermemory = "supermemory.cli:cli"
 [tool.ruff]
 target-version = "py310"
 line-length = 100
+exclude = ["autoresearch_*.py", "test_multisession*.py"]
 
 [tool.ruff.lint]
 select = [

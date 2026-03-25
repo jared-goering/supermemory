@@ -886,6 +886,7 @@ Return ONLY a JSON object, no other text."""
 
 class AggregateRequest(BaseModel):
     question: str
+    session_prefix: str | None = None  # Filter events to sessions matching this prefix
 
 
 class SearchEventsRequest(BaseModel):
@@ -893,6 +894,7 @@ class SearchEventsRequest(BaseModel):
     subtype: str | None = None
     time_range: str | None = None
     participants: list[str] | None = None
+    session_prefix: str | None = None  # Filter events to sessions matching this prefix
     limit: int = 20
 
 
@@ -946,6 +948,15 @@ def _aggregate_sync(req: AggregateRequest):
     if user_involvement:
         conditions.append("user_involvement = ?")
         params.append(user_involvement)
+
+    # If session_prefix is set, filter clusters to those with mentions in matching sessions
+    if req.session_prefix:
+        conditions.append("""id IN (
+            SELECT ecm.cluster_id FROM event_cluster_members ecm
+            JOIN event_mentions em ON em.id = ecm.event_id
+            WHERE em.session_key LIKE ?
+        )""")
+        params.append(f"bench_{req.session_prefix}%")
 
     where = " AND ".join(conditions) if conditions else "1=1"
 

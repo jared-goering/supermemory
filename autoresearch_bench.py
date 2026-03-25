@@ -12,17 +12,13 @@ Requires: eval server running on :8643 with ingested benchmark data.
 """
 
 import argparse
-import itertools
 import json
 import os
 import random
-import sqlite3
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
 import requests
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -31,25 +27,26 @@ EVAL_API = "http://127.0.0.1:8643"
 EVAL_DB = "/tmp/memorybench_eval.db"
 CHECKPOINT = "/Users/jared/Projects/memorybench/data/runs/eval-llm/checkpoint.json"
 EXPERIMENTS_LOG = "/Users/jared/Projects/openclaw-memory/experiments_bench.jsonl"
-AUTH_PROFILES_PATH = os.path.expanduser(
-    "~/.openclaw/agents/main/agent/auth-profiles.json"
-)
+AUTH_PROFILES_PATH = os.path.expanduser("~/.openclaw/agents/main/agent/auth-profiles.json")
 
 OPENROUTER_KEY_PATH = os.path.expanduser("~/.openclaw/secrets/openrouter-api-key.txt")
+
 
 def get_google_key():
     with open(AUTH_PROFILES_PATH) as f:
         data = json.load(f)
     profiles = data.get("profiles", data)
     if isinstance(profiles, dict):
-        for key, val in profiles.items():
+        for _key, val in profiles.items():
             if isinstance(val, dict) and val.get("provider") == "google":
                 return val.get("token") or val.get("apiKey")
     raise RuntimeError("No Google key found in auth-profiles.json")
 
+
 def get_openrouter_key():
     with open(OPENROUTER_KEY_PATH) as f:
         return f.read().strip()
+
 
 GOOGLE_KEY = get_google_key()
 OPENROUTER_KEY = get_openrouter_key()
@@ -61,23 +58,29 @@ SEARCH_SPACE = {
     "include_source": [True, False],
     "rerank_strategy": [
         "none",
-        "similarity_threshold",    # drop below threshold
-        "entity_boost",            # boost results sharing entities with query
-        "temporal_recency",        # boost recent memories
-        "diversity",               # MMR-style diversification
-        "category_weight",         # weight by category type
+        "similarity_threshold",  # drop below threshold
+        "entity_boost",  # boost results sharing entities with query
+        "temporal_recency",  # boost recent memories
+        "diversity",  # MMR-style diversification
+        "category_weight",  # weight by category type
     ],
-    "similarity_threshold": [0.0, 0.3, 0.4, 0.5, 0.6],  # only used with similarity_threshold strategy
+    "similarity_threshold": [
+        0.0,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+    ],  # only used with similarity_threshold strategy
     "temporal_weight": [0.0, 0.1, 0.2, 0.3],  # blend with recency
     "answer_strategy": [
-        "default",                 # current prompt
-        "cot_structured",          # chain-of-thought with structure
-        "entity_focused",          # group by entity first
-        "temporal_narrative",      # present as timeline
-        "concise_direct",          # minimal prompt, direct answer
+        "default",  # current prompt
+        "cot_structured",  # chain-of-thought with structure
+        "entity_focused",  # group by entity first
+        "temporal_narrative",  # present as timeline
+        "concise_direct",  # minimal prompt, direct answer
     ],
     "answer_model": [
-        "gemini-3-flash-preview",     # latest Gemini 3 Flash - smarter than 2.5
+        "gemini-3-flash-preview",  # latest Gemini 3 Flash - smarter than 2.5
     ],
     "max_context_memories": [3, 5, 10, 15, 20],  # how many memories to include in answer prompt
 }
@@ -85,18 +88,21 @@ SEARCH_SPACE = {
 
 # ─── Questions ────────────────────────────────────────────────────────────────
 
+
 def load_questions():
     """Load questions from memorybench checkpoint."""
     with open(CHECKPOINT) as f:
         data = json.load(f)
     questions = []
     for qid, q in data["questions"].items():
-        questions.append({
-            "id": qid,
-            "question": q["question"],
-            "ground_truth": q["groundTruth"],
-            "question_type": q["questionType"],
-        })
+        questions.append(
+            {
+                "id": qid,
+                "question": q["question"],
+                "ground_truth": q["groundTruth"],
+                "question_type": q["questionType"],
+            }
+        )
     return questions
 
 
@@ -108,25 +114,23 @@ JUDGE_PROMPTS = {
 Respond with ONLY a JSON object:
 {"score": 1, "label": "correct", "explanation": "..."} if the response contains the correct answer
 {"score": 0, "label": "incorrect", "explanation": "..."} if the response does not contain the correct answer""",
-
     "temporal-reasoning": """I will give you a question, a correct answer, and a response from a model. Please answer yes if the response contains the correct answer. Otherwise, answer no. If the response is equivalent to the correct answer or contains all the intermediate steps to get the correct answer, you should also answer yes. Do not penalize off-by-one errors for days/weeks/months.
 
 Respond with ONLY a JSON object:
 {"score": 1, "label": "correct", "explanation": "..."} if the response contains the correct answer
 {"score": 0, "label": "incorrect", "explanation": "..."} if the response does not contain the correct answer""",
-
     "knowledge-update": """I will give you a question, a correct answer, and a response from a model. Please answer yes if the response contains the correct answer. If the response contains some previous information along with an updated answer, the response should be considered as correct as long as the updated answer is the required answer.
 
 Respond with ONLY a JSON object:
 {"score": 1, "label": "correct", "explanation": "..."} if the response contains the correct answer
 {"score": 0, "label": "incorrect", "explanation": "..."} if the response does not contain the correct answer""",
-
     "single-session-preference": """I will give you a question, a rubric for desired personalized response, and a response from a model. Please answer yes if the response satisfies the desired response. The model does not need to reflect all the points in the rubric. The response is correct as long as it recalls and utilizes the user's personal information correctly.
 
 Respond with ONLY a JSON object:
 {"score": 1, "label": "correct", "explanation": "..."} if the response satisfies the rubric
 {"score": 0, "label": "incorrect", "explanation": "..."} if the response does not satisfy the rubric""",
 }
+
 
 def get_judge_prompt(question_type):
     for key in JUDGE_PROMPTS:
@@ -136,6 +140,7 @@ def get_judge_prompt(question_type):
 
 
 # ─── Answer Prompts ───────────────────────────────────────────────────────────
+
 
 def build_answer_prompt(question, memories, strategy="default"):
     """Build answer prompt based on strategy."""
@@ -228,7 +233,7 @@ Think through the entity groups step by step, then provide your answer after "AN
 def format_memories_default(memories):
     parts = []
     for i, m in enumerate(memories):
-        lines = [f"Memory {i+1} (sim: {m.get('similarity', 0):.3f}):"]
+        lines = [f"Memory {i + 1} (sim: {m.get('similarity', 0):.3f}):"]
         lines.append(m["content"])
         if m.get("document_date"):
             lines.append(f"Date: {m['document_date']}")
@@ -268,7 +273,9 @@ def format_memories_by_entity(memories):
                 if mid not in seen_ids:
                     seen_ids.add(mid)
                     date_str = f" ({m.get('document_date', '')})" if m.get("document_date") else ""
-                    source_tag = " [entity-expanded]" if m.get("source") == "entity_expansion" else ""
+                    source_tag = (
+                        " [entity-expanded]" if m.get("source") == "entity_expansion" else ""
+                    )
                     lines.append(f"  - {m['content']}{date_str}{source_tag}")
                     if m.get("relations"):
                         for rel in m["relations"]:
@@ -328,6 +335,7 @@ def format_memories_minimal(memories):
 
 # ─── Re-ranking ───────────────────────────────────────────────────────────────
 
+
 def rerank(memories, strategy, config):
     """Apply re-ranking strategy to search results."""
     if strategy == "none":
@@ -350,7 +358,9 @@ def rerank(memories, strategy, config):
         now = datetime.now(timezone.utc)
         for m in memories:
             try:
-                doc_date = datetime.fromisoformat(m.get("document_date", "2020-01-01").replace("Z", "+00:00"))
+                doc_date = datetime.fromisoformat(
+                    m.get("document_date", "2020-01-01").replace("Z", "+00:00")
+                )
                 days_ago = (now - doc_date).days
                 recency = max(0, 1 - days_ago / 365)  # 0-1 scale, 1 = today
             except (ValueError, TypeError):
@@ -396,6 +406,7 @@ def rerank(memories, strategy, config):
 
 
 # ─── API Calls ────────────────────────────────────────────────────────────────
+
 
 def search_memories(query, top_k=20, include_source=True, entity_search=False, entity_expand_k=50):
     """Search eval DB via API. If entity_search=True, uses entity-aware endpoint."""
@@ -486,7 +497,7 @@ System's Hypothesis: {hypothesis}"""
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             clean = "\n".join(lines)
-        json_match = json.loads(clean[clean.index("{"):clean.rindex("}")+1])
+        json_match = json.loads(clean[clean.index("{") : clean.rindex("}") + 1])
         return {
             "score": 1 if json_match.get("score") == 1 else 0,
             "label": json_match.get("label", "unknown"),
@@ -495,6 +506,7 @@ System's Hypothesis: {hypothesis}"""
     except (json.JSONDecodeError, ValueError):
         # Fallback: look for score field directly in text
         import re
+
         score_match = re.search(r'"score"\s*:\s*(\d)', result_text)
         if score_match:
             score = int(score_match.group(1))
@@ -516,6 +528,7 @@ System's Hypothesis: {hypothesis}"""
 
 
 # ─── Experiment Runner ────────────────────────────────────────────────────────
+
 
 def run_experiment(questions, config, experiment_id):
     """Run one experiment with given config against all questions."""
@@ -542,7 +555,7 @@ def run_experiment(questions, config, experiment_id):
         memories = rerank(memories, config["rerank_strategy"], config)
 
         # 3. Truncate to max_context_memories
-        memories = memories[:config["max_context_memories"]]
+        memories = memories[: config["max_context_memories"]]
 
         # 4. Build answer prompt
         prompt = build_answer_prompt(q["question"], memories, config["answer_strategy"])
@@ -557,9 +570,7 @@ def run_experiment(questions, config, experiment_id):
 
         # 6. Judge
         t2 = time.time()
-        judgment = judge_answer(
-            q["question"], q["ground_truth"], answer, q["question_type"]
-        )
+        judgment = judge_answer(q["question"], q["ground_truth"], answer, q["question_type"])
         judge_ms = (time.time() - t2) * 1000
 
         is_correct = judgment["score"] == 1
@@ -572,21 +583,21 @@ def run_experiment(questions, config, experiment_id):
         if is_correct:
             by_type[qtype]["correct"] += 1
 
-        results.append({
-            "question_id": q["id"],
-            "question_type": qtype,
-            "correct": is_correct,
-            "search_ms": round(search_ms, 1),
-            "answer_ms": round(answer_ms, 1),
-            "judge_ms": round(judge_ms, 1),
-            "num_memories": len(memories),
-            "explanation": judgment["explanation"][:200],
-        })
+        results.append(
+            {
+                "question_id": q["id"],
+                "question_type": qtype,
+                "correct": is_correct,
+                "search_ms": round(search_ms, 1),
+                "answer_ms": round(answer_ms, 1),
+                "judge_ms": round(judge_ms, 1),
+                "num_memories": len(memories),
+                "explanation": judgment["explanation"][:200],
+            }
+        )
 
     accuracy = correct / total if total > 0 else 0
-    type_accuracy = {
-        k: v["correct"] / v["total"] for k, v in by_type.items()
-    }
+    type_accuracy = {k: v["correct"] / v["total"] for k, v in by_type.items()}
 
     return {
         "accuracy": round(accuracy * 100, 2),
@@ -629,6 +640,7 @@ def smart_sample_config(history):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+
 def main():
     parser = argparse.ArgumentParser(description="Autoresearch: Supermemory Benchmark Optimizer")
     parser.add_argument("--max-experiments", type=int, default=100)
@@ -658,9 +670,11 @@ def main():
         exp_id = start_id + i
         config = smart_sample_config(history)
 
-        print(f"[Exp {exp_id}] top_k={config['top_k']}, rerank={config['rerank_strategy']}, "
-              f"answer={config['answer_strategy']}, max_ctx={config['max_context_memories']}, "
-              f"src={config['include_source']}, thresh={config['similarity_threshold']}")
+        print(
+            f"[Exp {exp_id}] top_k={config['top_k']}, rerank={config['rerank_strategy']}, "
+            f"answer={config['answer_strategy']}, max_ctx={config['max_context_memories']}, "
+            f"src={config['include_source']}, thresh={config['similarity_threshold']}"
+        )
 
         t0 = time.time()
         try:
@@ -675,12 +689,14 @@ def main():
             best_accuracy = result["accuracy"]
 
         marker = " 🏆 NEW BEST!" if is_best else ""
-        print(f"  Accuracy: {result['accuracy']}% ({result['correct']}/{result['total']}) "
-              f"in {elapsed:.1f}s{marker}")
+        print(
+            f"  Accuracy: {result['accuracy']}% ({result['correct']}/{result['total']}) "
+            f"in {elapsed:.1f}s{marker}"
+        )
 
         # Per-type breakdown
         for qtype, acc in sorted(result["by_type"].items()):
-            print(f"    {qtype}: {acc*100:.0f}%")
+            print(f"    {qtype}: {acc * 100:.0f}%")
 
         # Log experiment
         entry = {
@@ -715,9 +731,9 @@ def main():
     print(f"\nBest config (Exp {best['experiment_id']}):")
     for k, v in best["config"].items():
         print(f"  {k}: {v}")
-    print(f"\nBy type:")
+    print("\nBy type:")
     for qtype, acc in sorted(best["by_type"].items()):
-        print(f"  {qtype}: {acc*100:.0f}%")
+        print(f"  {qtype}: {acc * 100:.0f}%")
 
 
 if __name__ == "__main__":

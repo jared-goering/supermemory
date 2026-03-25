@@ -29,9 +29,7 @@ EVAL_API = "http://127.0.0.1:8643"
 CHECKPOINT = "/Users/jared/Projects/memorybench/data/runs/eval-llm/checkpoint.json"
 EXPERIMENTS_LOG = "/Users/jared/Projects/openclaw-memory/experiments_opus.jsonl"
 RESEARCH_LOG = "/Users/jared/Projects/openclaw-memory/research_opus.md"
-AUTH_PROFILES_PATH = os.path.expanduser(
-    "~/.openclaw/agents/main/agent/auth-profiles.json"
-)
+AUTH_PROFILES_PATH = os.path.expanduser("~/.openclaw/agents/main/agent/auth-profiles.json")
 
 
 def get_api_keys():
@@ -39,7 +37,7 @@ def get_api_keys():
         data = json.load(f)
     profiles = data.get("profiles", data)
     keys = {}
-    for key, val in profiles.items():
+    for _key, val in profiles.items():
         if isinstance(val, dict):
             provider = val.get("provider", "")
             tok = val.get("token") or val.get("apiKey")
@@ -89,12 +87,10 @@ from autoresearch_bench import (
     load_questions,
     run_experiment,
     search_memories,
-    call_llm as call_gemini,
-    judge_answer,
 )
 
-
 # ─── Opus API ─────────────────────────────────────────────────────────────────
+
 
 def call_opus(system_prompt, user_prompt, max_tokens=4096):
     """Call o3 (OpenAI) as the research agent — strongest reasoning model available."""
@@ -204,6 +200,7 @@ Design {n_experiments} experiments for the first round. Include:
 
 # ─── Detailed Failure Analysis ────────────────────────────────────────────────
 
+
 def get_detailed_results(questions, config):
     """Run experiment and capture detailed per-question results for analysis."""
     detailed = []
@@ -217,29 +214,34 @@ def get_detailed_results(questions, config):
 
         # Import rerank from bench
         from autoresearch_bench import rerank
+
         memories = rerank(memories, config["rerank_strategy"], config)
-        memories = memories[:config["max_context_memories"]]
+        memories = memories[: config["max_context_memories"]]
 
         # Capture what Opus needs to see
         mem_summary = []
         for i, m in enumerate(memories[:5]):  # Top 5 for analysis
-            mem_summary.append({
-                "rank": i + 1,
-                "content": m["content"][:200],
-                "similarity": round(m.get("similarity", 0), 3),
-                "category": m.get("category", "unknown"),
-                "document_date": m.get("document_date", "unknown"),
-                "has_relations": len(m.get("relations", [])) > 0,
-            })
+            mem_summary.append(
+                {
+                    "rank": i + 1,
+                    "content": m["content"][:200],
+                    "similarity": round(m.get("similarity", 0), 3),
+                    "category": m.get("category", "unknown"),
+                    "document_date": m.get("document_date", "unknown"),
+                    "has_relations": len(m.get("relations", [])) > 0,
+                }
+            )
 
-        detailed.append({
-            "question_id": q["id"],
-            "question": q["question"][:200],
-            "question_type": q["question_type"],
-            "ground_truth": q["ground_truth"][:200],
-            "num_retrieved": len(memories),
-            "top_memories": mem_summary,
-        })
+        detailed.append(
+            {
+                "question_id": q["id"],
+                "question": q["question"][:200],
+                "question_type": q["question_type"],
+                "ground_truth": q["ground_truth"][:200],
+                "num_retrieved": len(memories),
+                "top_memories": mem_summary,
+            }
+        )
 
     return detailed
 
@@ -251,22 +253,26 @@ def format_history(history):
 
     lines = []
     for h in history:
-        lines.append(f"Exp {h['experiment_id']}: {h['accuracy']}% "
-                     f"(rerank={h['config']['rerank_strategy']}, "
-                     f"answer={h['config']['answer_strategy']}, "
-                     f"top_k={h['config']['top_k']}, "
-                     f"max_ctx={h['config']['max_context_memories']}, "
-                     f"src={h['config']['include_source']}, "
-                     f"thresh={h['config']['similarity_threshold']})")
+        lines.append(
+            f"Exp {h['experiment_id']}: {h['accuracy']}% "
+            f"(rerank={h['config']['rerank_strategy']}, "
+            f"answer={h['config']['answer_strategy']}, "
+            f"top_k={h['config']['top_k']}, "
+            f"max_ctx={h['config']['max_context_memories']}, "
+            f"src={h['config']['include_source']}, "
+            f"thresh={h['config']['similarity_threshold']})"
+        )
         for qtype, acc in sorted(h["by_type"].items()):
-            lines.append(f"  {qtype}: {acc*100:.0f}%")
+            lines.append(f"  {qtype}: {acc * 100:.0f}%")
         lines.append("")
 
     # Summary stats
     accs = [h["accuracy"] for h in history]
-    best = max(history, key=lambda h: h["accuracy"])
-    lines.append(f"--- Summary: {len(history)} experiments, "
-                 f"mean={sum(accs)/len(accs):.1f}%, best={max(accs)}% ---")
+    max(history, key=lambda h: h["accuracy"])
+    lines.append(
+        f"--- Summary: {len(history)} experiments, "
+        f"mean={sum(accs) / len(accs):.1f}%, best={max(accs)}% ---"
+    )
 
     return "\n".join(lines)
 
@@ -283,8 +289,11 @@ def format_failure_details(history, questions):
             qid = r["question_id"]
             question_scores.setdefault(qid, []).append(r.get("correct", False))
 
-    always_fail = [qid for qid, scores in question_scores.items()
-                   if all(not s for s in scores) and len(scores) >= 2]
+    always_fail = [
+        qid
+        for qid, scores in question_scores.items()
+        if all(not s for s in scores) and len(scores) >= 2
+    ]
 
     if not always_fail:
         return ""
@@ -304,19 +313,22 @@ def format_failure_details(history, questions):
         lines.append(f"Expected: {d['ground_truth']}")
         lines.append(f"Retrieved {d['num_retrieved']} memories. Top 5:")
         for m in d["top_memories"]:
-            lines.append(f"  #{m['rank']} (sim={m['similarity']}, cat={m['category']}): {m['content']}")
+            lines.append(
+                f"  #{m['rank']} (sim={m['similarity']}, cat={m['category']}): {m['content']}"
+            )
 
     return "\n".join(lines)
 
 
 # ─── Main Loop ────────────────────────────────────────────────────────────────
 
+
 def main():
     parser = argparse.ArgumentParser(description="Opus-Driven Autoresearch")
-    parser.add_argument("--max-rounds", type=int, default=10,
-                        help="Max rounds of Opus analysis + experiments")
-    parser.add_argument("--exps-per-round", type=int, default=3,
-                        help="Experiments per round")
+    parser.add_argument(
+        "--max-rounds", type=int, default=10, help="Max rounds of Opus analysis + experiments"
+    )
+    parser.add_argument("--exps-per-round", type=int, default=3, help="Experiments per round")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
@@ -339,7 +351,9 @@ def main():
 
     # Initialize research log
     with open(RESEARCH_LOG, "a") as f:
-        f.write(f"\n\n# Opus Autoresearch Session — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
+        f.write(
+            f"\n\n# Opus Autoresearch Session — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        )
 
     n_exp = args.exps_per_round
     format_instructions = f"""Respond with your analysis, then a JSON block:
@@ -355,9 +369,9 @@ def main():
 ```"""
 
     for round_num in range(args.max_rounds):
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"ROUND {round_num + 1}/{args.max_rounds}")
-        print(f"{'='*60}\n")
+        print(f"{'=' * 60}\n")
 
         # Ask Opus to design experiments
         print("Asking Opus to analyze results and design experiments...")
@@ -405,11 +419,11 @@ def main():
 
             # Extract JSON
             try:
-                json_str = opus_response[opus_response.index("{"):opus_response.rindex("}") + 1]
+                json_str = opus_response[opus_response.index("{") : opus_response.rindex("}") + 1]
                 parsed = json.loads(json_str)
                 experiments = parsed.get("experiments", [])
                 hypotheses = parsed.get("hypotheses", [])
-                print(f"  Hypotheses:")
+                print("  Hypotheses:")
                 for h in hypotheses[:5]:
                     print(f"    - {h}")
                 print()
@@ -421,10 +435,11 @@ def main():
         if not experiments:
             print("  Using random fallback configs")
             from autoresearch_bench import sample_config
+
             experiments = [sample_config() for _ in range(n_exp)]
 
         # Run each experiment
-        for i, config in enumerate(experiments):
+        for _i, config in enumerate(experiments):
             exp_id = len(history)
 
             # Ensure all required keys exist
@@ -435,12 +450,14 @@ def main():
             # Ensure answer_model is Gemini 3 Flash
             config["answer_model"] = "gemini-3-flash-preview"
 
-            print(f"  [Exp {exp_id}] top_k={config['top_k']}, "
-                  f"rerank={config['rerank_strategy']}, "
-                  f"answer={config['answer_strategy']}, "
-                  f"max_ctx={config['max_context_memories']}, "
-                  f"src={config['include_source']}, "
-                  f"thresh={config['similarity_threshold']}")
+            print(
+                f"  [Exp {exp_id}] top_k={config['top_k']}, "
+                f"rerank={config['rerank_strategy']}, "
+                f"answer={config['answer_strategy']}, "
+                f"max_ctx={config['max_context_memories']}, "
+                f"src={config['include_source']}, "
+                f"thresh={config['similarity_threshold']}"
+            )
 
             t1 = time.time()
             try:
@@ -455,11 +472,13 @@ def main():
                 best_accuracy = result["accuracy"]
 
             marker = " 🏆 NEW BEST!" if is_best else ""
-            print(f"    Accuracy: {result['accuracy']}% ({result['correct']}/{result['total']}) "
-                  f"in {elapsed:.1f}s{marker}")
+            print(
+                f"    Accuracy: {result['accuracy']}% ({result['correct']}/{result['total']}) "
+                f"in {elapsed:.1f}s{marker}"
+            )
 
             for qtype, acc in sorted(result["by_type"].items()):
-                print(f"      {qtype}: {acc*100:.0f}%")
+                print(f"      {qtype}: {acc * 100:.0f}%")
 
             # Save detailed results for Opus to analyze
             entry = {
@@ -487,16 +506,20 @@ def main():
             round_exps = [h for h in history if h.get("round") == round_num]
             f.write(f"### Round {round_num + 1} Results\n\n")
             for e in round_exps:
-                f.write(f"- Exp {e['experiment_id']}: {e['accuracy']}% "
-                        f"({e['config']['rerank_strategy']}, {e['config']['answer_strategy']})\n")
+                f.write(
+                    f"- Exp {e['experiment_id']}: {e['accuracy']}% "
+                    f"({e['config']['rerank_strategy']}, {e['config']['answer_strategy']})\n"
+                )
             f.write(f"\nBest overall: {best_accuracy}%\n\n")
 
         # Early stopping: if we've plateaued
         if len(history) >= 15:
             recent = [h["accuracy"] for h in history[-10:]]
             if max(recent) - min(recent) < 3.0:
-                print(f"\n⚠️  Plateau detected (last 10 runs within 3% of each other). "
-                      f"May need architectural changes, not just parameter tuning.")
+                print(
+                    "\n⚠️  Plateau detected (last 10 runs within 3% of each other). "
+                    "May need architectural changes, not just parameter tuning."
+                )
 
     # Final summary
     print("\n" + "=" * 60)
@@ -508,9 +531,9 @@ def main():
     for k, v in best["config"].items():
         if k != "answer_model":
             print(f"  {k}: {v}")
-    print(f"\nBy type:")
+    print("\nBy type:")
     for qtype, acc in sorted(best["by_type"].items()):
-        print(f"  {qtype}: {acc*100:.0f}%")
+        print(f"  {qtype}: {acc * 100:.0f}%")
 
     print(f"\nResearch log: {RESEARCH_LOG}")
     print(f"Experiments: {EXPERIMENTS_LOG}")
