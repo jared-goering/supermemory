@@ -37,13 +37,13 @@ The result: your agent doesn't just remember *what* was said. It knows what chan
 | Entity profiles (auto-built) | ✅ | ✅ | ✅ | ❌ |
 | No cloud account required | ✅ | ❌ | ❌ | ✅ |
 
-### Research background
+### How it works
 
-The architectural choices in Supermemory are grounded in [Supermemory.ai's research](https://supermemory.ai/research/), which demonstrated that atomic fact extraction + relational versioning + temporal grounding achieves **85.2% on LongMemEval_s** (Gemini 3 Pro) vs **71.2% for Zep** and **60.2% for naive full-context retrieval** with gpt-4o. That's a 14.6-point improvement over the next-best memory system and a 25-point gap over stuffing everything into context.
+Most memory systems just stuff raw conversation text into a vector store. That's noisy and breaks down over time.
 
-The key insight: searching over clean atomic memories (high signal, low noise) and then injecting original source chunks for detail dramatically outperforms searching over raw conversation text. Coupling memories with temporal metadata and relations solves the temporal reasoning and knowledge-update categories where vector-store approaches historically fail.
+Supermemory extracts clean atomic facts from conversations, links them with relational versioning (so updated facts supersede old ones), and grounds them temporally (separating when something was recorded from when it happened). Searching over high-signal atomic memories then injecting original source chunks for detail dramatically outperforms naive retrieval.
 
-We implement the same core innovations locally with SQLite and on-device embeddings, trading their cloud infrastructure for zero-dependency portability.
+Everything runs locally with SQLite and on-device embeddings. No cloud dependency, no external API required for search.
 
 **Relational versioning** means when you tell your agent "I moved from Seattle to Portland," it doesn't just add a new fact. It creates an UPDATE relation linking the new memory to the old one, marks the old memory as superseded, and preserves the full history. You can still query "where did I live in January?" and get the right answer.
 
