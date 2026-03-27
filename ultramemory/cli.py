@@ -149,6 +149,54 @@ def stats(ctx):
 
 
 @cli.command()
+@click.option("--batch-size", default=100, help="Memories per embedding batch")
+@click.option("--dry-run", is_flag=True, help="Estimate cost without re-embedding")
+@click.pass_context
+def reembed(ctx, batch_size, dry_run):
+    """Re-embed all current memories with the configured embedding model."""
+    cfg = get_config()
+    engine = get_engine(ctx.obj["db"])
+
+    provider = cfg.get("embedding_provider", "local")
+    model = cfg.get("embedding_model", "all-MiniLM-L6-v2")
+    dim = cfg.get("embedding_dim", 384)
+
+    click.echo(f"Embedding config: provider={provider}, model={model}, dim={dim}")
+
+    if dry_run:
+        result = engine.reembed_all(batch_size=batch_size, dry_run=True)
+        click.echo("\nDry run results:")
+        click.echo(f"  Memories to re-embed: {result['total']}")
+        click.echo(f"  Estimated tokens:     {result['estimated_tokens']:,}")
+        click.echo(f"  Estimated cost:       ${result['estimated_cost_usd']:.4f}")
+        return
+
+    # Get count first
+    result = engine.reembed_all(batch_size=batch_size, dry_run=True)
+    if result["total"] == 0:
+        click.echo("No current memories to re-embed.")
+        return
+
+    click.echo(
+        f"\nWill re-embed {result['total']} memories (~{result['estimated_tokens']:,} tokens, ~${result['estimated_cost_usd']:.4f})"
+    )
+    if not click.confirm("Proceed?", default=False):
+        click.echo("Aborted.")
+        return
+
+    def progress(done, total):
+        click.echo(f"  Re-embedded {done} / {total} memories")
+
+    result = engine.reembed_all(
+        batch_size=batch_size,
+        dry_run=False,
+        progress_callback=progress,
+    )
+
+    click.echo(f"\nDone. Re-embedded {result['reembedded']} / {result['total']} memories.")
+
+
+@cli.command()
 @click.pass_context
 def init(ctx):
     """Initialize ~/.ultramemory/ with default config and empty database."""

@@ -1191,6 +1191,93 @@ class MemoryEngine:
                 for r in rows
             ]
 
+    # ── Re-embedding ──────────────────────────────────────────────────────
+
+    def reembed_all(
+        self,
+        batch_size: int = 100,
+        dry_run: bool = False,
+        progress_callback=None,
+    ) -> dict:
+        """Re-embed all current memories using the currently configured provider/model.
+
+        Args:
+            batch_size: Number of memories to embed per batch.
+            dry_run: If True, only count tokens and estimate cost without embedding.
+            progress_callback: Optional callable(reembedded, total) for progress updates.
+
+        Returns:
+            Dict with total, reembedded, estimated_tokens, estimated_cost_usd, dry_run.
+        """
+        conn = self._conn()
+        try:
+            rows = conn.execute("SELECT id, content FROM memories WHERE is_current = 1").fetchall()
+        finally:
+            conn.close()
+
+        total = len(rows)
+        if total == 0:
+            return {
+                "total": 0,
+                "reembedded": 0,
+                "estimated_tokens": 0,
+                "estimated_cost_usd": 0.0,
+                "dry_run": dry_run,
+            }
+
+        # Estimate tokens: ~4 chars per token
+        estimated_tokens = sum(len(r["content"]) for r in rows) // 4
+        estimated_cost = estimated_tokens * 0.20 / 1_000_000
+
+        if dry_run:
+            return {
+                "total": total,
+                "reembedded": 0,
+                "estimated_tokens": estimated_tokens,
+                "estimated_cost_usd": estimated_cost,
+                "dry_run": True,
+            }
+
+        reembedded = 0
+        for i in range(0, total, batch_size):
+            batch = rows[i : i + batch_size]
+            texts = [r["content"] for r in batch]
+            ids = [r["id"] for r in batch]
+
+            embeddings = self._embed_batch(texts)
+
+            conn = self._conn()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                for j, mem_id in enumerate(ids):
+                    blob = self._vec_to_blob(embeddings[j])
+                    conn.execute(
+                        "UPDATE memories SET embedding = ?, updated_at = datetime('now') WHERE id = ?",
+                        (blob, mem_id),
+                    )
+                conn.commit()
+                reembedded += len(batch)
+            except Exception:
+                conn.rollback()
+                conn.close()
+                raise
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+            if progress_callback:
+                progress_callback(reembedded, total)
+
+        return {
+            "total": total,
+            "reembedded": reembedded,
+            "estimated_tokens": estimated_tokens,
+            "estimated_cost_usd": estimated_cost,
+            "dry_run": False,
+        }
+
     # ── Stats ────────────────────────────────────────────────────────────
 
     def get_stats(self) -> dict:

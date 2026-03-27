@@ -1065,6 +1065,27 @@ def _search_events_sync(req: SearchEventsRequest):
     return {"results": results, "count": len(results)}
 
 
+class ReembedRequest(BaseModel):
+    batch_size: int = 100
+    dry_run: bool = False
+
+
+@app.post("/api/reembed")
+async def reembed(req: ReembedRequest):
+    """Re-embed all current memories with the configured embedding model."""
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None,
+        partial(engine.reembed_all, batch_size=req.batch_size, dry_run=req.dry_run),
+    )
+    # Rebuild in-memory cache after re-embedding
+    if not req.dry_run and result.get("reembedded", 0) > 0:
+        global _embed_matrix, _embed_meta, _cache_built_at
+        _embed_matrix, _embed_meta = _build_embedding_cache()
+        _cache_built_at = datetime.now()
+    return result
+
+
 @app.post("/api/cache/refresh")
 async def refresh_cache_v2():
     """Rebuild the in-memory embedding cache after new ingestions."""

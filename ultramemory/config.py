@@ -168,12 +168,15 @@ def default_config_yaml() -> str:
 # Embedding model
 # For local: any sentence-transformers model (e.g. all-MiniLM-L6-v2, all-mpnet-base-v2)
 # For litellm: any litellm embedding model (e.g. text-embedding-3-small, cohere/embed-english-v3.0, voyage/voyage-3)
+# Gemini Embedding 2 (Preview): gemini/gemini-embedding-2 (768 dim, $0.20/1M tokens)
+#   Requires GOOGLE_API_KEY env var (or GEMINI_API_KEY)
 # embedding_model: all-MiniLM-L6-v2
 
 # Embedding dimensions (must match the model)
 # Local all-MiniLM-L6-v2: 384, all-mpnet-base-v2: 768
 # OpenAI text-embedding-3-small: 1536, text-embedding-3-large: 3072
 # Cohere embed-english-v3.0: 1024
+# Gemini gemini-embedding-2: 768
 # embedding_dim: 384
 
 # API server settings
