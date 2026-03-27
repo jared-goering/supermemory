@@ -468,7 +468,7 @@ class MemoryEngine:
         if "gemini" not in self._embedding_model.lower():
             raise ValueError(
                 "Multimodal media ingestion requires a Gemini embedding model. "
-                "Set embedding_model to 'gemini/gemini-embedding-2' in your config."
+                "Set embedding_model to 'gemini/gemini-embedding-2-preview' in your config."
             )
 
         # Get or generate text description

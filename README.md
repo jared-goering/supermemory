@@ -343,7 +343,7 @@ Ultramemory defaults to local embeddings (sentence-transformers, free, no API ke
 | Backend | Model | Dimensions | Cost | Quality |
 |---------|-------|-----------|------|---------|
 | **Local** (default) | all-MiniLM-L6-v2 | 384 | Free | Good |
-| **Gemini** | gemini/gemini-embedding-2 | 768 | $0.20/1M tokens | Best |
+| **Gemini** | gemini/gemini-embedding-2-preview | 3072 | $0.20/1M tokens | Best |
 | **OpenAI** | text-embedding-3-small | 1536 | $0.02/1M tokens | Great |
 | **OpenAI** | text-embedding-3-large | 3072 | $0.13/1M tokens | Great |
 | **Cohere** | cohere/embed-english-v3.0 | 1024 | $0.10/1M tokens | Great |
@@ -359,8 +359,8 @@ export GOOGLE_API_KEY=your-key
 ```yaml
 # ultramemory.yaml
 embedding_provider: litellm
-embedding_model: gemini/gemini-embedding-2
-embedding_dim: 768
+embedding_model: gemini/gemini-embedding-2-preview
+embedding_dim: 3072
 ```
 
 Then re-embed your existing memories:
