@@ -316,6 +316,238 @@ class MemoryEngine:
         norms = np.where(norms == 0, 1, norms)
         return (vecs / norms).astype(np.float32)
 
+    # ── Multimodal embedding helpers ────────────────────────────────
+
+    SUPPORTED_MEDIA_TYPES = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+    }
+
+    def _get_genai_client(self):
+        """Lazy-initialize and cache the Google GenAI client."""
+        if not hasattr(self, "_genai_client") or self._genai_client is None:
+            try:
+                from google import genai
+            except ImportError:
+                raise ImportError(
+                    "google-genai is required for multimodal media embedding. "
+                    "Install with: pip install ultramemory[gemini]"
+                ) from None
+
+            import os
+
+            api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+            if not api_key:
+                raise ValueError(
+                    "GOOGLE_API_KEY or GEMINI_API_KEY environment variable is required "
+                    "for multimodal media embedding."
+                )
+            self._genai_client = genai.Client(api_key=api_key)
+        return self._genai_client
+
+    def _embed_media(self, file_path: str) -> np.ndarray:
+        """Embed a media file using Gemini's multimodal embedding API.
+
+        Requires: pip install ultramemory[gemini] and GOOGLE_API_KEY env var.
+        Only works when embedding_model contains 'gemini'.
+        """
+        import os
+
+        from google.genai import types
+
+        ext = os.path.splitext(file_path)[1].lower()
+        mime_type = self.SUPPORTED_MEDIA_TYPES.get(ext)
+        if not mime_type:
+            supported = ", ".join(sorted(self.SUPPORTED_MEDIA_TYPES.keys()))
+            raise ValueError(f"Unsupported media format '{ext}'. Supported: {supported}")
+
+        with open(file_path, "rb") as f:
+            data = f.read()
+
+        client = self._get_genai_client()
+        response = client.models.embed_content(
+            model="gemini-embedding-2-preview",
+            contents=[types.Part.from_bytes(data=data, mime_type=mime_type)],
+        )
+
+        embedding = np.array(response.embeddings[0].values, dtype=np.float32)
+
+        # Normalize for cosine similarity
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+
+        return embedding
+
+    def _describe_media(self, file_path: str, user_description: str | None = None) -> str:
+        """Generate a text description of a media file using the LLM."""
+        import base64
+        import os
+
+        if user_description:
+            return user_description
+
+        ext = os.path.splitext(file_path)[1].lower()
+        basename = os.path.basename(file_path)
+
+        # For images: use vision-capable LLM via litellm
+        if ext in (".png", ".jpg", ".jpeg"):
+            with open(file_path, "rb") as f:
+                img_bytes = f.read()
+            b64 = base64.b64encode(img_bytes).decode("utf-8")
+            mime = self.SUPPORTED_MEDIA_TYPES[ext]
+            data_url = f"data:{mime};base64,{b64}"
+
+            response = litellm.completion(
+                model=self.model_name,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": data_url},
+                            },
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Describe this image in 1-3 sentences for use as a memory. "
+                                    "Focus on the key subjects, setting, and any notable details. "
+                                    "Be specific and factual."
+                                ),
+                            },
+                        ],
+                    }
+                ],
+                temperature=0.0,
+            )
+            return response.choices[0].message.content.strip()
+
+        # For audio/video: generate description from filename (LLM vision doesn't support these)
+        media_type = "audio" if ext in (".mp3", ".wav") else "video"
+        return f"{media_type.title()} file: {basename}"
+
+    def ingest_media(
+        self,
+        file_path: str,
+        session_key: str,
+        agent_id: str,
+        description: str | None = None,
+        category: str | None = None,
+        document_date: str | None = None,
+    ) -> dict:
+        """Ingest a media file (image, audio, video) as a memory.
+
+        The media is embedded using Gemini's multimodal API directly,
+        mapping it into the same vector space as text memories.
+        A text description is generated for the content field.
+
+        Returns dict with memory id and details.
+        """
+        import os
+
+        if document_date is None:
+            document_date = datetime.now().isoformat()[:10]
+
+        # Validate file exists
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Media file not found: {file_path}")
+
+        # Validate extension
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext not in self.SUPPORTED_MEDIA_TYPES:
+            supported = ", ".join(sorted(self.SUPPORTED_MEDIA_TYPES.keys()))
+            raise ValueError(f"Unsupported media format '{ext}'. Supported: {supported}")
+
+        # Validate embedding model is Gemini
+        if "gemini" not in self._embedding_model.lower():
+            raise ValueError(
+                "Multimodal media ingestion requires a Gemini embedding model. "
+                "Set embedding_model to 'gemini/gemini-embedding-2' in your config."
+            )
+
+        # Get or generate text description
+        desc = self._describe_media(file_path, description)
+
+        # Embed the actual media bytes (NOT the text description)
+        embedding = self._embed_media(file_path)
+
+        # Determine media type label
+        if ext in (".png", ".jpg", ".jpeg"):
+            media_type = "image"
+        elif ext in (".mp3", ".wav"):
+            media_type = "audio"
+        else:
+            media_type = "video"
+
+        category = category or "media"
+        mem_id = str(uuid.uuid4())
+        chunk_id = str(uuid.uuid4())
+        abs_path = os.path.abspath(file_path)
+
+        conn = self._conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            # Store source chunk with file path reference
+            conn.execute(
+                "INSERT INTO source_chunks (id, content, session_key, agent_id, document_date) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (chunk_id, f"[media:{ext}] {abs_path}", session_key, agent_id, document_date),
+            )
+
+            # Store memory with multimodal embedding
+            conn.execute(
+                """INSERT INTO memories
+                   (id, content, category, confidence, document_date,
+                    source_session, source_agent, source_chunk_id, embedding)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    mem_id,
+                    desc,
+                    category,
+                    1.0,
+                    document_date,
+                    session_key,
+                    agent_id,
+                    chunk_id,
+                    self._vec_to_blob(embedding),
+                ),
+            )
+
+            # Extract entities from the description text
+            entities = []
+            try:
+                entity_response = self._llm_call(
+                    f"Extract entity names (people, places, organizations) from this text. "
+                    f"Return a JSON array of strings.\n\nText: {desc}\n\n"
+                    f"Return ONLY a JSON array, no other text."
+                )
+                entities = self._parse_json(entity_response)
+                if isinstance(entities, list):
+                    self._store_entities(conn, mem_id, entities)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+            conn.commit()
+        finally:
+            conn.close()
+
+        return {
+            "id": mem_id,
+            "content": desc,
+            "category": category,
+            "media_type": media_type,
+            "file_path": abs_path,
+            "embedding_dim": len(embedding),
+            "entities": entities,
+        }
+
     @staticmethod
     def _blob_to_vec(blob: bytes) -> np.ndarray:
         return np.frombuffer(blob, dtype=np.float32)

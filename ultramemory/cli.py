@@ -28,21 +28,47 @@ def cli(ctx, db):
 @cli.command()
 @click.option("--text", help="Text to ingest")
 @click.option("--file", "filepath", help="File to ingest")
+@click.option("--media", "media_path", help="Media file to ingest (image, audio, video)")
+@click.option("--description", "media_desc", help="Optional description for media file")
 @click.option("--session", required=True, help="Session key")
 @click.option("--agent", required=True, help="Agent ID")
 @click.option("--date", default=None, help="Document date (ISO format, default: today)")
 @click.pass_context
-def ingest(ctx, text, filepath, session, agent, date):
-    """Ingest text or file into memory."""
-    if not text and not filepath:
-        click.echo("Error: provide --text or --file", err=True)
+def ingest(ctx, text, filepath, media_path, media_desc, session, agent, date):
+    """Ingest text, file, or media into memory."""
+    if not text and not filepath and not media_path:
+        click.echo("Error: provide --text, --file, or --media", err=True)
         sys.exit(1)
 
+    engine = get_engine(ctx.obj["db"])
+
+    # Media ingestion path
+    if media_path:
+        click.echo(f"Ingesting media file: {media_path}")
+        try:
+            result = engine.ingest_media(
+                file_path=media_path,
+                session_key=session,
+                agent_id=agent,
+                description=media_desc,
+                document_date=date,
+            )
+        except (ImportError, ValueError, FileNotFoundError) as e:
+            click.echo(f"Error: {e}", err=True)
+            sys.exit(1)
+
+        click.echo(f"\n  ● [{result['category']}] {result['content']}")
+        click.echo(f"    media_type: {result['media_type']}")
+        click.echo(f"    file: {result['file_path']}")
+        click.echo(f"    embedding_dim: {result['embedding_dim']}")
+        click.echo(f"\nDone. Memory stored in {ctx.obj['db']}")
+        return
+
+    # Text ingestion path
     if filepath:
         with open(filepath) as f:
             text = f.read()
 
-    engine = get_engine(ctx.obj["db"])
     click.echo(f"Ingesting text ({len(text)} chars) from session '{session}'...")
 
     memories = engine.ingest(text, session_key=session, agent_id=agent, document_date=date)

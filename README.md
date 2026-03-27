@@ -35,6 +35,31 @@ The result: your agent doesn't just remember *what* was said. It knows what chan
 | Entity profiles (auto-built) | ✅ | ✅ | ✅ | ❌ |
 | No cloud account required | ✅ | ❌ | ❌ | ✅ |
 | Pluggable embeddings (local/Gemini/OpenAI) | ✅ | ❌ | ❌ | ❌ |
+| Multimodal search (images, audio, video) | ✅ | ❌ | ❌ | ❌ |
+
+## Multimodal memory
+
+With Gemini Embedding 2, Ultramemory can ingest and search across images, audio, and video — not just text. All media types live in the same embedding space, so a text search like "sunset at the beach" finds matching photos, audio clips, and video.
+
+```bash
+# Ingest media files
+ultramemory ingest --media photo.jpg --session trip --agent my-agent
+ultramemory ingest --media meeting.mp3 --session work --agent my-agent
+ultramemory ingest --media clip.mp4 --description "Product demo walkthrough" --session work --agent my-agent
+
+# Search finds media alongside text memories
+ultramemory search "beach vacation"
+```
+
+Requires Gemini embedding backend: `pip install ultramemory[gemini]` + `GOOGLE_API_KEY`.
+
+### Supported media
+
+| Type | Formats | Max size |
+|------|---------|----------|
+| Images | PNG, JPEG | 6 per request |
+| Audio | MP3, WAV | 80 seconds |
+| Video | MP4, MOV | 2 minutes |
 
 ### Benchmark
 
@@ -140,6 +165,8 @@ Security: bind 127.0.0.1 by default, optional API key auth, locked CORS origins
 ultramemory init                                    # Create ~/.ultramemory/ with config + empty DB
 ultramemory ingest --text "..." --session s --agent a  # Extract and store memories
 ultramemory ingest --file notes.md --session s --agent a  # Ingest from file
+ultramemory ingest --media photo.jpg --session s --agent a  # Ingest media file
+ultramemory ingest --media clip.mp4 --description "..." --session s --agent a  # Media with description
 ultramemory search "query"                          # Semantic search (current memories)
 ultramemory search "query" --all-versions           # Include superseded memories
 ultramemory search "query" --as-of 2025-06-01       # Time-travel query
@@ -217,6 +244,7 @@ curl -X POST http://localhost:8642/api/entity/Alice/merge \
 |--------|----------|-------------|
 | `GET` | `/api/health` | Health check (memory count, source chunks, version) |
 | `POST` | `/api/ingest` | Extract and store memories from text |
+| `POST` | `/api/ingest-media` | Ingest media file (multipart upload) |
 | `POST` | `/api/search` | Semantic search with filters |
 | `POST` | `/api/recall` | Fast recall using cached embeddings |
 | `POST` | `/api/startup-context` | Multi-query context for agent startup |

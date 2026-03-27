@@ -39,6 +39,9 @@ dependencies = [
 local = [
     "sentence-transformers>=2.2.0",
 ]
+gemini = [
+    "google-genai>=1.0.0",
+]
 ui = [
     # Note: UI requires npm/pnpm to be installed separately
     # Run: cd ui && npm install && npm run build

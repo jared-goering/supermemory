@@ -5,7 +5,7 @@ import json
 from datetime import datetime
 from functools import partial
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
@@ -171,6 +171,54 @@ async def ingest(req: IngestRequest):
         _embed_matrix, _embed_meta = _build_embedding_cache()
         _cache_built_at = datetime.now()
     return {"memories": memories, "count": len(memories)}
+
+
+@app.post("/api/ingest-media")
+async def ingest_media(
+    file: UploadFile,
+    session_key: str = Form("ui"),
+    agent_id: str = Form("user"),
+    description: str | None = Form(None),
+    category: str | None = Form(None),
+    document_date: str | None = Form(None),
+):
+    """Ingest a media file (image, audio, video) via multipart upload."""
+    import os
+    import tempfile
+
+    # Save uploaded file to a temp location
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if not ext:
+        return JSONResponse(status_code=400, content={"detail": "File must have an extension"})
+
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        tmp_path = tmp.name
+        contents = await file.read()
+        tmp.write(contents)
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            partial(
+                engine.ingest_media,
+                file_path=tmp_path,
+                session_key=session_key,
+                agent_id=agent_id,
+                description=description,
+                category=category,
+                document_date=document_date,
+            ),
+        )
+        # Auto-refresh cache so search sees the new memory immediately
+        global _embed_matrix, _embed_meta, _cache_built_at
+        _embed_matrix, _embed_meta = _build_embedding_cache()
+        _cache_built_at = datetime.now()
+        return result
+    except (ImportError, ValueError, FileNotFoundError) as e:
+        return JSONResponse(status_code=400, content={"detail": str(e)})
+    finally:
+        os.unlink(tmp_path)
 
 
 class IngestRawRequest(BaseModel):
