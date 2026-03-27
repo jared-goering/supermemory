@@ -1113,6 +1113,232 @@ def _search_events_sync(req: SearchEventsRequest):
     return {"results": results, "count": len(results)}
 
 
+class AggregateSearchRequest(BaseModel):
+    question: str
+    session_prefix: str | None = None
+    top_k: int = 50
+    include_source: bool = True
+
+
+@app.post("/api/aggregate_search")
+async def aggregate_search(req: AggregateSearchRequest):
+    """Multi-session aggregate search: broad memory retrieval + event clusters for counting/aggregation questions."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, partial(_aggregate_search_sync, req))
+
+
+def _aggregate_search_sync(req: AggregateSearchRequest):
+    """
+    Combines three retrieval strategies for multi-session aggregate questions:
+    1. Vector search with high top_k for broad coverage
+    2. Event clusters matching the question topic
+    3. Keyword-based memory scan for completeness
+
+    Returns all evidence organized for LLM synthesis.
+    """
+    import re
+    import sqlite3 as _sqlite3
+
+    conn = _sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = _sqlite3.Row
+
+    session_filter = f"bench_{req.session_prefix}%" if req.session_prefix else None
+
+    # Phase 1: Vector search with high top_k
+    vector_results = _search_sync(
+        SearchRequest(
+            query=req.question,
+            top_k=req.top_k,
+            include_source=req.include_source,
+            current_only=True,
+        )
+    )
+    vector_memories = vector_results.get("results", [])
+
+    # Filter to session prefix if specified
+    if session_filter:
+        vector_memories = [
+            m
+            for m in vector_memories
+            if m.get("source_session", "").startswith(session_filter.rstrip("%"))
+        ]
+
+    # Phase 2: Get event clusters for this question's sessions, filtered by topic relevance
+    cluster_conditions = []
+    cluster_params = []
+    if session_filter:
+        cluster_conditions.append("""ec.id IN (
+            SELECT ecm.cluster_id FROM event_cluster_members ecm
+            JOIN event_mentions em ON em.id = ecm.event_id
+            WHERE em.session_key LIKE ?
+        )""")
+        cluster_params.append(session_filter)
+
+    # Filter clusters by question keywords matching event_type, subtype, or canonical_label
+    question_lower = req.question.lower()
+    topic_stop = {
+        "how",
+        "many",
+        "much",
+        "did",
+        "do",
+        "have",
+        "has",
+        "had",
+        "i",
+        "my",
+        "me",
+        "the",
+        "a",
+        "an",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "of",
+        "and",
+        "or",
+        "is",
+        "was",
+        "were",
+        "what",
+        "which",
+        "when",
+        "where",
+        "who",
+        "all",
+        "each",
+        "every",
+        "any",
+        "this",
+        "that",
+        "it",
+        "we",
+        "last",
+        "past",
+        "total",
+        "different",
+        "spend",
+        "spent",
+        "hours",
+        "go",
+        "went",
+        "gone",
+        "get",
+        "got",
+        "more",
+        "than",
+        "week",
+        "month",
+        "year",
+        "time",
+        "times",
+        "about",
+    }
+    topic_words = re.findall(r"\b[a-z]+\b", question_lower)
+    topic_keywords = [w for w in topic_words if w not in topic_stop and len(w) > 2]
+
+    # Simple stemming: expand each keyword to include stem variants
+    def _stem_variants(word):
+        """Generate simple stem variants for LIKE matching."""
+        variants = {word}
+        # Strip common suffixes
+        for suffix in ("ings", "ing", "tion", "tions", "ed", "es", "s"):
+            if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+                variants.add(word[: -len(suffix)])
+        # Also add the word itself as a stem prefix
+        if len(word) >= 4:
+            variants.add(word[: max(3, len(word) - 2)])
+        return variants
+
+    if topic_keywords:
+        kw_conditions = []
+        for kw in topic_keywords:
+            stems = _stem_variants(kw)
+            for stem in stems:
+                kw_conditions.append(
+                    "(ec.event_type LIKE ? OR ec.subtype LIKE ? OR ec.canonical_label LIKE ?)"
+                )
+                cluster_params.extend([f"%{stem}%", f"%{stem}%", f"%{stem}%"])
+        cluster_conditions.append("(" + " OR ".join(kw_conditions) + ")")
+
+    cluster_where = " AND ".join(cluster_conditions) if cluster_conditions else "1=1"
+    clusters = conn.execute(
+        f"""SELECT ec.id, ec.event_type, ec.subtype, ec.canonical_label,
+                   ec.distinct_key, ec.participants, ec.normalized_date,
+                   ec.duration_minutes, ec.user_involvement, ec.confidence
+            FROM event_clusters ec
+            WHERE {cluster_where}
+            ORDER BY ec.normalized_date""",
+        cluster_params,
+    ).fetchall()
+    event_clusters = [dict(c) for c in clusters]
+
+    # Phase 3: Keyword scan — search memories by topic keywords for completeness
+    keyword_memories = []
+    seen_ids = {m["id"] for m in vector_memories}
+    keywords = topic_keywords  # reuse from Phase 2
+
+    if keywords and session_filter:
+        for kw in keywords[:5]:
+            rows = conn.execute(
+                """SELECT id, content, category, confidence, document_date,
+                          event_date, source_session, source_chunk_id, version
+                   FROM memories
+                   WHERE content LIKE ? AND is_current = 1 AND source_session LIKE ?
+                   LIMIT 30""",
+                (f"%{kw}%", session_filter),
+            ).fetchall()
+            for r in rows:
+                if r["id"] not in seen_ids:
+                    seen_ids.add(r["id"])
+                    keyword_memories.append(
+                        {
+                            "id": r["id"],
+                            "content": r["content"],
+                            "category": r["category"],
+                            "confidence": r["confidence"],
+                            "document_date": r["document_date"],
+                            "event_date": r["event_date"],
+                            "source_session": r["source_session"],
+                            "source_chunk_id": r["source_chunk_id"],
+                            "version": r["version"],
+                            "is_current": True,
+                            "similarity": 0.0,
+                            "source": "keyword_scan",
+                            "relations": [],
+                        }
+                    )
+
+    # Source chunks for vector memories are already hydrated by _search_sync when include_source=True.
+    # Hydrate source chunks for keyword memories.
+    if req.include_source:
+        for m in keyword_memories:
+            chunk_id = m.get("source_chunk_id")
+            if chunk_id and not m.get("source_chunk"):
+                row = conn.execute(
+                    "SELECT content FROM source_chunks WHERE id = ?", (chunk_id,)
+                ).fetchone()
+                if row:
+                    m["source_chunk"] = row["content"]
+
+    conn.close()
+
+    all_memories = vector_memories + keyword_memories
+
+    return {
+        "memories": all_memories,
+        "memory_count": len(all_memories),
+        "vector_count": len(vector_memories),
+        "keyword_count": len(keyword_memories),
+        "event_clusters": event_clusters,
+        "cluster_count": len(event_clusters),
+    }
+
+
 class ReembedRequest(BaseModel):
     batch_size: int = 100
     dry_run: bool = False
