@@ -29,7 +29,7 @@ PROD_DB = os.path.expanduser("~/Projects/openclaw-memory/memory.db")
 QUESTIONS_DIR = os.path.expanduser(
     "~/Projects/memorybench/data/benchmarks/longmemeval/datasets/questions"
 )
-WORKERS = 5  # concurrent sessions per question
+WORKERS = 10  # concurrent sessions per question
 INGEST_TIMEOUT = 300  # seconds per session ingest
 
 
@@ -49,20 +49,29 @@ def check_server(url, name):
         return False
 
 
-def get_ingested_qids(db_path):
-    """Get set of question IDs already ingested in the DB."""
+def get_ingested_sessions(db_path):
+    """Get set of source_session tags already in the DB."""
     conn = sqlite3.connect(db_path, timeout=30)
     rows = conn.execute(
         "SELECT DISTINCT source_session FROM memories WHERE source_session LIKE 'bench_%'"
     ).fetchall()
     conn.close()
+    return {r[0] for r in rows}
 
+
+def get_ingested_qids(db_path):
+    """Get set of question IDs already ingested in the DB (heuristic)."""
+    sessions = get_ingested_sessions(db_path)
     qids = set()
-    for (src,) in rows:
-        parts = src.replace("bench_", "").split("-")
-        if parts[0] == "gpt4":
-            qids.add(f"{parts[0]}_{parts[1]}")
+    for src in sessions:
+        # Extract qid from bench_<qid>-<rest>
+        after_bench = src[len("bench_"):]
+        # qid is the first part before the first "-" unless it starts with "gpt4_"
+        if after_bench.startswith("gpt4_"):
+            parts = after_bench.split("-", 1)
+            qids.add(parts[0])
         else:
+            parts = after_bench.split("-", 1)
             qids.add(parts[0])
     return qids
 
@@ -109,32 +118,49 @@ def ingest_session(api_url, messages, container_tag, session_id, date=None):
         )
         r.raise_for_status()
         data = r.json()
-        return data.get("memories_created", 0)
+        return data.get("count", data.get("memories_created", 0))
     except Exception as e:
         log(f"    ⚠ Session {session_id} failed: {e}")
         return -1
 
 
-def ingest_question(api_url, question):
-    """Ingest all sessions for one benchmark question, concurrently."""
+def ingest_question(api_url, question, existing_sessions=None):
+    """Ingest all sessions for one benchmark question, concurrently.
+    Skips sessions whose container_tag already exists in the DB."""
     qid = question["question_id"]
     sessions = question.get("haystack_sessions", [])
     session_ids = question.get("haystack_session_ids", [])
     dates = question.get("haystack_dates", [])
 
+    existing_sessions = existing_sessions or set()
     total_memories = 0
     failed = 0
+    skipped = 0
 
     def _do_one(i):
         sess = sessions[i]
         sid = session_ids[i] if i < len(session_ids) else f"session-{i}"
         d = dates[i] if i < len(dates) else None
         container_tag = f"bench_{qid}-{sid}"
+
+        if container_tag in existing_sessions:
+            return 0  # Already ingested
+
         count = ingest_session(api_url, sess, container_tag, sid, d)
         if count < 0:
             time.sleep(2)
             count = ingest_session(api_url, sess, container_tag, sid, d)
         return count
+
+    # Check how many will be skipped
+    for i in range(len(sessions)):
+        sid = session_ids[i] if i < len(session_ids) else f"session-{i}"
+        tag = f"bench_{qid}-{sid}"
+        if tag in existing_sessions:
+            skipped += 1
+
+    if skipped == len(sessions):
+        return 0, 0  # All sessions already ingested
 
     with ThreadPoolExecutor(max_workers=WORKERS) as executor:
         futures = {executor.submit(_do_one, i): i for i in range(len(sessions))}
@@ -190,6 +216,10 @@ def step1_ingest():
     total_sessions = sum(len(q.get("haystack_sessions", [])) for q in remaining)
     log(f"Total sessions to process: {total_sessions}")
 
+    # Pre-load existing sessions for dedup
+    existing_sessions = get_ingested_sessions(EVAL_DB)
+    log(f"Existing session tags in DB: {len(existing_sessions)}")
+
     start = time.time()
     completed = 0
     total_new_memories = 0
@@ -199,7 +229,7 @@ def step1_ingest():
         n_sessions = len(q.get("haystack_sessions", []))
         log(f"  [{completed + 1}/{len(remaining)}] Ingesting {qid} ({n_sessions} sessions)...")
 
-        memories, failures = ingest_question(EVAL_API, q)
+        memories, failures = ingest_question(EVAL_API, q, existing_sessions)
         total_new_memories += memories
         completed += 1
 

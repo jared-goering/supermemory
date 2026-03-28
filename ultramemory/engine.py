@@ -778,27 +778,31 @@ class MemoryEngine:
         created_memories = []
         conn = self._conn()
         try:
-            # Load existing embeddings for dedup (read-only, WAL allows concurrent reads)
-            existing_rows = conn.execute(
-                "SELECT id, embedding FROM memories WHERE is_current = 1 AND embedding IS NOT NULL"
-            ).fetchall()
+            _fast = os.environ.get("ULTRAMEMORY_FAST_INGEST")
 
+            # Load existing embeddings for dedup (skip in fast mode for performance)
+            existing_rows = []
             existing_matrix = None
-            if existing_rows:
-                existing_matrix = np.empty(
-                    (len(existing_rows), self._embedding_dim), dtype=np.float32
-                )
-                for ei, er in enumerate(existing_rows):
-                    blob = er["embedding"]
-                    if blob and len(blob) == self._embedding_dim * 4:
-                        existing_matrix[ei] = np.frombuffer(blob, dtype=np.float32)
-                    else:
-                        existing_matrix[ei] = 0
+            if not _fast:
+                existing_rows = conn.execute(
+                    "SELECT id, embedding FROM memories WHERE is_current = 1 AND embedding IS NOT NULL"
+                ).fetchall()
+
+                if existing_rows:
+                    existing_matrix = np.empty(
+                        (len(existing_rows), self._embedding_dim), dtype=np.float32
+                    )
+                    for ei, er in enumerate(existing_rows):
+                        blob = er["embedding"]
+                        if blob and len(blob) == self._embedding_dim * 4:
+                            existing_matrix[ei] = np.frombuffer(blob, dtype=np.float32)
+                        else:
+                            existing_matrix[ei] = 0
 
             # Build insert batch (filter dupes first, then single INSERT batch)
             insert_batch = []
             for i, mem_data in enumerate(extracted):
-                # Skip exact content duplicates
+                # Skip exact content duplicates (cheap text check, keep even in fast mode)
                 existing = conn.execute(
                     "SELECT id FROM memories WHERE content = ? AND is_current = 1 LIMIT 1",
                     (mem_data["content"],),
@@ -808,8 +812,8 @@ class MemoryEngine:
 
                 embedding = embeddings[i]
 
-                # Skip semantic near-duplicates
-                if existing_matrix is not None and len(existing_rows) > 0:
+                # Skip semantic near-duplicates (skip in fast mode)
+                if not _fast and existing_matrix is not None and len(existing_rows) > 0:
                     sims = existing_matrix @ embedding
                     if float(np.max(sims)) > self._dedup_threshold:
                         continue
