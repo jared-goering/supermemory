@@ -19,7 +19,7 @@ os.environ.setdefault("ULTRAMEMORY_MODEL", "gemini/gemini-2.5-flash")
 from ultramemory.engine import MemoryEngine
 
 WORKERS = 8
-DB_PATH = "/tmp/memorybench_eval.db"
+DB_PATH = os.environ.get("ULTRAMEMORY_DB_PATH", "/tmp/memorybench_eval.db")
 
 conn = sqlite3.connect(DB_PATH, timeout=30)
 conn.row_factory = sqlite3.Row

@@ -4,6 +4,7 @@ Local-first structured memory with temporal versioning, relations, and hybrid se
 """
 
 import json
+import os
 import sqlite3
 import uuid
 from datetime import datetime
@@ -869,6 +870,11 @@ class MemoryEngine:
             return []
 
         # ── Phase 3: Relation detection via LLM (no DB lock) ────────────
+        # Skip expensive phases in fast/batch mode
+        _fast_mode = os.environ.get("ULTRAMEMORY_FAST_INGEST")
+        if _fast_mode:
+            return [{k: v for k, v in m.items() if k != "embedding"} for m in created_memories]
+
         # Read existing memories for similarity comparison
         conn = self._conn()
         try:
@@ -970,18 +976,19 @@ class MemoryEngine:
                 conn.close()
 
         # ── Phase 5: Profile updates via LLM (no DB lock during LLM) ────
-        all_entities = set()
-        for mem in created_memories:
-            for entity in mem.get("entities", []):
-                all_entities.add(entity)
+        if not os.environ.get("ULTRAMEMORY_SKIP_PROFILES"):
+            all_entities = set()
+            for mem in created_memories:
+                for entity in mem.get("entities", []):
+                    all_entities.add(entity)
 
-        if all_entities:
-            for entity_name in all_entities:
-                self._update_profile_safe(entity_name)
+            if all_entities:
+                for entity_name in all_entities:
+                    self._update_profile_safe(entity_name)
 
         # ── Phase 6: Structured fact extraction (no DB lock during LLM) ──
-        # Retrieve chunk_id from the first created memory (all share the same chunk)
-        if created_memories:
+        # Skip if ULTRAMEMORY_SKIP_FACTS=1 (for batch ingestion; backfill later)
+        if created_memories and not os.environ.get("ULTRAMEMORY_SKIP_FACTS"):
             sample_id = created_memories[0]["id"]
             conn = self._conn()
             try:
