@@ -923,11 +923,13 @@ AGGREGATE_PARSE_PROMPT = """Parse this question into a structured aggregation in
 Question: {question}
 
 Return a JSON object with:
-- "operation": one of "count_distinct" (how many different events) or "sum_duration" (total hours/minutes)
+- "operation": one of "count_distinct" (how many different events) or "sum_duration" (total hours/minutes) or "sum_value" (total of some quantity)
 - "event_types": array of event type strings to match (e.g. ["wedding"], ["exercise"], ["art_event"])
 - "subtypes": array of subtype strings if specific (e.g. ["yoga", "jogging"]) or empty array
 - "time_scope": time scope string like "this_year", "last_week", "past_month", or null if no time constraint
 - "user_involvement": filter like "attended", "did", or null for any involvement
+- "fact_categories": array of broad topic categories for structured fact lookup (e.g. ["gaming"], ["wedding"], ["exercise", "fitness"])
+- "fact_types": array of fact_type to match (e.g. ["attendance", "count"], ["duration"], ["cost"])
 
 Return ONLY a JSON object, no other text."""
 
@@ -948,7 +950,7 @@ class SearchEventsRequest(BaseModel):
 
 @app.post("/api/aggregate")
 async def aggregate(req: AggregateRequest):
-    """Detect aggregate intent, query event_clusters, return deterministic answer."""
+    """Detect aggregate intent, query structured_facts first, fall back to event_clusters."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, partial(_aggregate_sync, req))
 
@@ -973,65 +975,140 @@ def _aggregate_sync(req: AggregateRequest):
     event_types = intent.get("event_types", [])
     subtypes = intent.get("subtypes", [])
     user_involvement = intent.get("user_involvement")
+    fact_categories = intent.get("fact_categories", [])
+    fact_types = intent.get("fact_types", [])
 
-    # Build SQL query against event_clusters
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
 
-    conditions = []
-    params = []
+    # ── Phase 1: Try structured_facts first ────────────────────────────
+    structured_answer = None
+    structured_facts = []
+
+    fact_conditions = ["is_user_action = 1"]
+    fact_params = []
+
+    if fact_categories:
+        cat_clauses = []
+        for cat in fact_categories:
+            cat_clauses.append("category LIKE ?")
+            fact_params.append(f"%{cat.lower()}%")
+        fact_conditions.append("(" + " OR ".join(cat_clauses) + ")")
+
+    if fact_types:
+        ft_clauses = []
+        for ft in fact_types:
+            ft_clauses.append("fact_type LIKE ?")
+            fact_params.append(f"%{ft.lower()}%")
+        fact_conditions.append("(" + " OR ".join(ft_clauses) + ")")
+
+    if req.session_prefix:
+        fact_conditions.append("session_key LIKE ?")
+        fact_params.append(f"bench_{req.session_prefix}%")
+
+    fact_where = " AND ".join(fact_conditions)
+    fact_rows = conn.execute(
+        f"""SELECT id, fact_type, category, subject, predicate,
+                   value, unit, date, confidence, is_user_action, session_key
+            FROM structured_facts WHERE {fact_where}
+            ORDER BY date DESC""",
+        fact_params,
+    ).fetchall()
+
+    structured_facts = [dict(r) for r in fact_rows]
+
+    if structured_facts:
+        # Deduplicate by subject (case-insensitive) for count_distinct
+        if operation == "count_distinct":
+            seen_subjects = set()
+            unique_facts = []
+            for f in structured_facts:
+                subj_key = f["subject"].lower().strip()
+                if subj_key not in seen_subjects:
+                    seen_subjects.add(subj_key)
+                    unique_facts.append(f)
+            structured_answer = len(unique_facts)
+            structured_facts = unique_facts
+        elif operation in ("sum_duration", "sum_value"):
+            total = sum(f["value"] or 0 for f in structured_facts)
+            # Convert minutes to hours if unit is minutes/hours context
+            units = {f.get("unit", "") for f in structured_facts}
+            if "minutes" in units and operation == "sum_duration":
+                structured_answer = round(total / 60, 2)
+            elif "hours" in units:
+                structured_answer = round(total, 2)
+            else:
+                structured_answer = round(total, 2)
+        else:
+            structured_answer = len(structured_facts)
+
+    # ── Phase 2: Also query event_clusters (fallback / comparison) ─────
+    cluster_conditions = []
+    cluster_params = []
 
     if event_types:
         placeholders = ",".join("?" for _ in event_types)
-        conditions.append(f"event_type IN ({placeholders})")
-        params.extend([t.lower() for t in event_types])
+        cluster_conditions.append(f"event_type IN ({placeholders})")
+        cluster_params.extend([t.lower() for t in event_types])
 
     if subtypes:
         placeholders = ",".join("?" for _ in subtypes)
-        conditions.append(f"subtype IN ({placeholders})")
-        params.extend([s.lower() for s in subtypes])
+        cluster_conditions.append(f"subtype IN ({placeholders})")
+        cluster_params.extend([s.lower() for s in subtypes])
 
     if user_involvement:
-        conditions.append("user_involvement = ?")
-        params.append(user_involvement)
+        cluster_conditions.append("user_involvement = ?")
+        cluster_params.append(user_involvement)
 
-    # If session_prefix is set, filter clusters to those with mentions in matching sessions
     if req.session_prefix:
-        conditions.append("""id IN (
+        cluster_conditions.append("""id IN (
             SELECT ecm.cluster_id FROM event_cluster_members ecm
             JOIN event_mentions em ON em.id = ecm.event_id
             WHERE em.session_key LIKE ?
         )""")
-        params.append(f"bench_{req.session_prefix}%")
+        cluster_params.append(f"bench_{req.session_prefix}%")
 
-    where = " AND ".join(conditions) if conditions else "1=1"
+    cluster_where = " AND ".join(cluster_conditions) if cluster_conditions else "1=1"
 
     rows = conn.execute(
         f"""SELECT id, event_type, subtype, canonical_label, distinct_key,
                    participants, normalized_date, duration_minutes,
                    user_involvement, confidence
-            FROM event_clusters WHERE {where}
+            FROM event_clusters WHERE {cluster_where}
             ORDER BY normalized_date DESC""",
-        params,
+        cluster_params,
     ).fetchall()
 
     events = [dict(r) for r in rows]
     conn.close()
 
+    # Compute cluster-based answer
     if operation == "count_distinct":
-        answer = len(events)
+        cluster_answer = len(events)
     elif operation == "sum_duration":
         total = sum(e["duration_minutes"] or 0 for e in events)
-        answer = round(total / 60, 2)  # Return in hours
+        cluster_answer = round(total / 60, 2)
     else:
-        answer = len(events)
+        cluster_answer = len(events)
+
+    # Use structured_facts answer if available, otherwise fall back to clusters
+    if structured_answer is not None:
+        answer = structured_answer
+        source = "structured_facts"
+    else:
+        answer = cluster_answer
+        source = "event_clusters"
 
     return {
         "answer": answer,
+        "source": source,
+        "structured_answer": structured_answer,
+        "cluster_answer": cluster_answer,
         "operation": operation,
         "intent": intent,
+        "structured_facts": structured_facts[:50],
         "events": events[:50],
     }
 

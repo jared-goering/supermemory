@@ -229,6 +229,20 @@ def search_standard(question, top_k=20):
     return resp.json().get("results", []), [], {}
 
 
+def search_structured(question, session_prefix):
+    """Use the /api/aggregate endpoint for structured fact-based answers."""
+    resp = requests.post(
+        f"{EVAL_API}/api/aggregate",
+        json={
+            "question": question,
+            "session_prefix": session_prefix,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 def search_entity(question, top_k=30, entity_expand_k=50):
     """Entity-aware search with cross-session expansion."""
     resp = requests.post(
@@ -329,6 +343,9 @@ def build_aggregate_prompt(question, memories, event_clusters, extracted_events=
                 "participated",
                 "performed",
                 "completed",
+                "did",
+                "went",
+                "visited",
             ):
                 continue
             # Topic relevance check: event type/label should overlap with question
@@ -402,17 +419,24 @@ You are answering a question that requires gathering and combining information f
 
 {extracted_context if extracted_context else cluster_context if cluster_context else ""}
 
-{"" if extracted_context else "Supporting memories:" + chr(10) + memory_context + chr(10)}{"Supporting memories (for context only — do NOT use these to add to the count above):" + chr(10) + memory_context + chr(10) if extracted_context else ""}
+{"" if extracted_context else "Memories from conversations:" + chr(10) + memory_context + chr(10)}
 RULES:
-{"- The PRE-EXTRACTED EVENTS list above is your starting point, but it may STILL contain duplicates. You MUST aggressively merge entries that could refer to the same real-world event." if extracted_context else "- Count only DISTINCT events. Merge duplicates aggressively."}
-- MERGE RULE: If two entries could POSSIBLY be the same person/event described differently (e.g., "sister's wedding" and "Rachel's wedding" could be the same if the sister is Rachel; "college roommate's wedding" and "Emily's wedding" if Emily is the roommate), count them as ONE.
-- MERGE RULE: Generic descriptions (e.g., "cousin's wedding") should be merged with specific ones (e.g., "Cousin Rachel's wedding at a vineyard") unless dates clearly differ.
-- ONGOING/RECURRING activities (e.g., "weekly classes") = ONE event type.
-- Only count events the user DIRECTLY attended/participated in.
-- When in doubt, ALWAYS MERGE. Undercounting > overcounting.
+{"- The PRE-EXTRACTED EVENTS list above is your ONLY source. Do NOT invent additional events." if extracted_context else "- Count only DISTINCT events. Merge duplicates aggressively."}
+- MERGE RULE: If two entries could POSSIBLY be the same event described differently, they ARE the same event. Examples:
+  * "sister's wedding" + "Rachel's wedding" = SAME (sister could be Rachel)
+  * "cousin's wedding" + "Cousin Rachel's wedding at vineyard" = SAME
+  * "college roommate's wedding" + "Emily's wedding" = SAME (roommate could be Emily)
+  * "coworker's wedding at a vineyard" + "cousin Rachel's wedding at a vineyard" = SAME (same venue detail suggests same event)
+- MERGE RULE: Same venue/location/setting = strong signal they're the same event. MERGE unless dates clearly differ.
+- ONGOING/RECURRING activities (e.g., "weekly classes") = ONE activity, not multiple events.
+- Only count events the user DIRECTLY attended/participated in. Exclude: planned, mentioned, gifted, observed, expo visits.
+- When in doubt, ALWAYS MERGE. Undercounting is better than overcounting.
 - For amounts/durations: compute from explicit numbers only.
 
-ANSWER: First list the TRULY DISTINCT events after merging, then give FINAL ANSWER: [number or brief fact]"""
+ANSWER FORMAT:
+1. First, group all entries that could be the same event together.
+2. For each merged group, give ONE line: "Event N: [description] (merged from: entries X, Y, Z)"
+3. End with: FINAL ANSWER: [number or brief fact]"""
 
 
 def build_standard_prompt(question, memories):
@@ -519,6 +543,11 @@ STRATEGIES = {
         "search": "standard",
         "top_k": 50,
     },
+    "structured": {
+        "description": "Structured facts + aggregate search (hybrid)",
+        "search": "structured",
+        "top_k": 50,
+    },
 }
 
 
@@ -536,7 +565,15 @@ def run_question(question, strategy_name, strategy_config, answer_model="gemini-
     top_k = strategy_config.get("top_k", 50)
 
     # Search
-    if search_type == "aggregate":
+    structured_data = None
+    if search_type == "structured":
+        # Phase 1: Get structured answer from /api/aggregate
+        structured_data = search_structured(question["question"], session_prefix)
+        # Phase 2: Also get broad context from aggregate_search for LLM fallback
+        memories, event_clusters, meta = search_aggregate(
+            question["question"], session_prefix, top_k
+        )
+    elif search_type == "aggregate":
         memories, event_clusters, meta = search_aggregate(
             question["question"], session_prefix, top_k
         )
@@ -552,7 +589,45 @@ def run_question(question, strategy_name, strategy_config, answer_model="gemini-
     search_ms = (time.time() - t0) * 1000
 
     # Build prompt
-    if search_type == "aggregate":
+    if search_type == "structured" and structured_data:
+        s_answer = structured_data.get("structured_answer")
+        s_facts = structured_data.get("structured_facts", [])
+        if s_answer is not None and s_facts:
+            # Build a prompt that presents the structured facts for LLM verification
+            fact_lines = []
+            for i, f in enumerate(s_facts, 1):
+                fact_lines.append(
+                    f"  {i}. {f['subject']} — {f['predicate']} "
+                    f"(value={f.get('value')}, unit={f.get('unit')}, date={f.get('date')})"
+                )
+            facts_block = "\n".join(fact_lines)
+            extracted_events = meta.get("extracted_events", [])
+            prompt = f"""Question: {question["question"]}
+
+STRUCTURED FACTS from database (deterministic, pre-extracted):
+{facts_block}
+
+Structured answer: {s_answer} (based on {len(s_facts)} distinct facts)
+
+Additionally, here is broader context from memory search for verification:
+
+{build_aggregate_prompt(question["question"], memories, event_clusters, extracted_events)}
+
+RULES:
+- The STRUCTURED FACTS above are your PRIMARY source. They are machine-extracted and deduplicated.
+- Use the memory context ONLY to verify or correct the structured answer.
+- If the structured facts are clearly wrong or incomplete based on memory evidence, explain why and give a corrected count.
+- Otherwise, trust the structured answer.
+
+ANSWER FORMAT:
+FINAL ANSWER: [number or brief fact]"""
+        else:
+            # No structured facts — fall back to standard aggregate prompt
+            extracted_events = meta.get("extracted_events", [])
+            prompt = build_aggregate_prompt(
+                question["question"], memories, event_clusters, extracted_events
+            )
+    elif search_type == "aggregate":
         extracted_events = meta.get("extracted_events", [])
         prompt = build_aggregate_prompt(
             question["question"], memories, event_clusters, extracted_events
@@ -574,6 +649,9 @@ def run_question(question, strategy_name, strategy_config, answer_model="gemini-
     judge_ms = (time.time() - t2) * 1000
 
     extracted_event_count = len(meta.get("extracted_events", []))
+    structured_fact_count = (
+        len(structured_data.get("structured_facts", [])) if structured_data else 0
+    )
     return {
         "question_id": qid,
         "question": question["question"],
@@ -586,6 +664,8 @@ def run_question(question, strategy_name, strategy_config, answer_model="gemini-
         "memory_count": len(memories),
         "cluster_count": len(event_clusters),
         "extracted_event_count": extracted_event_count,
+        "structured_fact_count": structured_fact_count,
+        "structured_answer": structured_data.get("structured_answer") if structured_data else None,
         "search_ms": round(search_ms, 1),
         "answer_ms": round(answer_ms, 1),
         "judge_ms": round(judge_ms, 1),
@@ -609,9 +689,14 @@ def run_benchmark(questions, strategy_name, strategy_config, answer_model="gemin
         print(f"    Got: {result['answer'][:200]}")
         if not result["correct"]:
             print(f"    Judge: {result['judgment'].get('explanation', '')[:150]}")
+        sf_info = ""
+        if result.get("structured_fact_count"):
+            sf_info = f", StructFacts: {result['structured_fact_count']}"
+            if result.get("structured_answer") is not None:
+                sf_info += f" (ans={result['structured_answer']})"
         print(
             f"    Memories: {result['memory_count']}, Clusters: {result['cluster_count']}, "
-            f"Events: {result.get('extracted_event_count', '?')}, "
+            f"Events: {result.get('extracted_event_count', '?')}{sf_info}, "
             f"Search: {result['search_ms']:.0f}ms, Answer: {result['answer_ms']:.0f}ms"
         )
         print()
@@ -699,6 +784,8 @@ def main():
                     "memory_count": r["memory_count"],
                     "cluster_count": r["cluster_count"],
                     "extracted_event_count": r.get("extracted_event_count", 0),
+                    "structured_fact_count": r.get("structured_fact_count", 0),
+                    "structured_answer": r.get("structured_answer"),
                 }
                 for r in result["results"]
             ],

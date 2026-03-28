@@ -161,6 +161,31 @@ CREATE INDEX IF NOT EXISTS idx_event_mentions_session ON event_mentions(session_
 CREATE INDEX IF NOT EXISTS idx_event_mentions_chunk ON event_mentions(source_chunk_id);
 CREATE INDEX IF NOT EXISTS idx_event_clusters_type ON event_clusters(event_type, subtype);
 CREATE INDEX IF NOT EXISTS idx_event_clusters_distinct ON event_clusters(distinct_key);
+
+-- Structured facts layer for aggregate queries
+CREATE TABLE IF NOT EXISTS structured_facts (
+    id TEXT PRIMARY KEY,
+    memory_id TEXT NOT NULL,
+    source_chunk_id TEXT,
+    session_key TEXT,
+    fact_type TEXT NOT NULL,
+    category TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    value REAL,
+    unit TEXT,
+    date TEXT,
+    confidence REAL DEFAULT 1.0,
+    is_user_action BOOLEAN DEFAULT 1,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (memory_id) REFERENCES memories(id),
+    FOREIGN KEY (source_chunk_id) REFERENCES source_chunks(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_structured_facts_memory ON structured_facts(memory_id);
+CREATE INDEX IF NOT EXISTS idx_structured_facts_type ON structured_facts(fact_type, category);
+CREATE INDEX IF NOT EXISTS idx_structured_facts_category ON structured_facts(category);
+CREATE INDEX IF NOT EXISTS idx_structured_facts_session ON structured_facts(session_key);
 """
 
 # ── LLM Prompts ──────────────────────────────────────────────────────────────
@@ -226,6 +251,39 @@ Conversation text:
 ---
 
 Return ONLY a JSON array of event objects, no other text. Return empty array [] if no events found."""
+
+FACT_EXTRACT_PROMPT = """Extract quantifiable, structured facts from this conversation text.
+A fact is a measurable assertion: a count, duration, cost, attendance, distance, etc.
+
+For each fact, return a JSON object with:
+- "fact_type": one of "quantity", "attendance", "duration", "cost", "count", "distance", "frequency"
+- "category": broad topic (e.g. "gaming", "wedding", "exercise", "travel", "social", "cooking", "work", "shopping", "health", "education")
+- "subject": what or who — the specific thing (e.g. "Assassin's Creed Odyssey", "cousin Rachel's wedding", "marathon training")
+- "predicate": the action verb (e.g. "played", "attended", "spent", "ran", "bought", "cooked")
+- "value": numeric value (e.g. 70 for 70 hours, 1 for a single attendance, 270 for $270). Use null if no number is stated.
+- "unit": measurement unit (e.g. "hours", "count", "dollars", "minutes", "miles", "sessions")
+- "date": ISO date string if known, otherwise null
+- "confidence": float 0-1 (1.0 = explicitly stated number, 0.7 = clearly implied, 0.4 = rough estimate)
+- "is_user_action": true if the USER did/experienced this, false if it's metadata or about someone else
+
+CRITICAL RULES:
+- ONLY extract facts where the USER personally did something (is_user_action=true) unless it's clearly about someone else (set is_user_action=false).
+- For gaming: "I played Assassin's Creed for 70 hours" → is_user_action=true, value=70, unit="hours"
+  But "Assassin's Creed typically takes 60-100 hours to complete" → is_user_action=false (game metadata)
+- For weddings: "I attended my cousin Rachel's wedding" → fact_type="attendance", category="wedding", value=1, unit="count", is_user_action=true
+  But "Rachel is planning her wedding" → do NOT extract (no user action yet)
+- For duration/cost: only extract if a specific number is mentioned or strongly implied.
+- Each distinct user action = one fact. Do NOT merge multiple actions into one.
+- If the user mentions attending an event, that's fact_type="attendance" with value=1, unit="count".
+
+Document date for temporal reference: {document_date}
+
+Conversation text:
+---
+{text}
+---
+
+Return ONLY a JSON array of fact objects, no other text. Return empty array [] if no quantifiable facts found."""
 
 PROFILE_PROMPT = """Given these memories about the entity "{entity_name}", build a profile.
 
@@ -921,6 +979,30 @@ class MemoryEngine:
             for entity_name in all_entities:
                 self._update_profile_safe(entity_name)
 
+        # ── Phase 6: Structured fact extraction (no DB lock during LLM) ──
+        # Retrieve chunk_id from the first created memory (all share the same chunk)
+        if created_memories:
+            sample_id = created_memories[0]["id"]
+            conn = self._conn()
+            try:
+                row = conn.execute(
+                    "SELECT source_chunk_id FROM memories WHERE id = ?", (sample_id,)
+                ).fetchone()
+                chunk_id = row["source_chunk_id"] if row else None
+            finally:
+                conn.close()
+
+            if chunk_id:
+                try:
+                    self.extract_facts(
+                        text,
+                        session_key=session_key,
+                        chunk_id=chunk_id,
+                        document_date=document_date,
+                    )
+                except Exception:
+                    pass  # Non-critical: don't fail ingest if fact extraction fails
+
         return [{k: v for k, v in m.items() if k != "embedding"} for m in created_memories]
 
     def _update_profile_safe(self, entity_name: str):
@@ -1173,6 +1255,124 @@ class MemoryEngine:
             parts.append("")
         parts.append(normalized_date or "")
         return "|".join(parts)
+
+    # ── Structured Fact Extraction ──────────────────────────────────────
+
+    def extract_facts(
+        self,
+        text: str,
+        session_key: str,
+        chunk_id: str | None = None,
+        document_date: str | None = None,
+    ) -> list[dict]:
+        """
+        Extract structured, quantifiable facts from text and store in structured_facts.
+
+        Links facts to memories sharing the same chunk_id.
+        Returns list of created fact dicts.
+        """
+        if document_date is None:
+            document_date = datetime.now().isoformat()[:10]
+
+        # LLM extraction (no DB lock)
+        prompt = FACT_EXTRACT_PROMPT.format(text=text, document_date=document_date)
+        response = self._llm_call(prompt)
+        try:
+            facts = self._parse_json(response)
+        except (json.JSONDecodeError, ValueError):
+            return []
+
+        if not facts or not isinstance(facts, list):
+            return []
+
+        created = []
+        conn = self._conn()
+        try:
+            # Find memory_ids linked to this chunk
+            memory_ids = []
+            if chunk_id:
+                memory_rows = conn.execute(
+                    "SELECT id FROM memories WHERE source_chunk_id = ?",
+                    (chunk_id,),
+                ).fetchall()
+                memory_ids = [r["id"] for r in memory_rows]
+
+            if not memory_ids:
+                # No memories to link — skip storing facts without a parent
+                return []
+
+            conn.execute("BEGIN IMMEDIATE")
+
+            for fact in facts:
+                if not isinstance(fact, dict):
+                    continue
+
+                fact_type = (fact.get("fact_type") or "").strip()
+                category = (fact.get("category") or "").strip()
+                subject = (fact.get("subject") or "").strip()
+                predicate = (fact.get("predicate") or "").strip()
+
+                if not fact_type or not category or not subject or not predicate:
+                    continue
+
+                value = fact.get("value")
+                if value is not None:
+                    try:
+                        value = float(value)
+                    except (TypeError, ValueError):
+                        value = None
+
+                unit = fact.get("unit")
+                date = fact.get("date")
+                confidence = fact.get("confidence", 1.0)
+                is_user_action = fact.get("is_user_action", True)
+
+                # Create one fact row per linked memory
+                for memory_id in memory_ids:
+                    fact_id = str(uuid.uuid4())
+                    conn.execute(
+                        """INSERT INTO structured_facts
+                           (id, memory_id, source_chunk_id, session_key,
+                            fact_type, category, subject, predicate,
+                            value, unit, date, confidence, is_user_action)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            fact_id,
+                            memory_id,
+                            chunk_id,
+                            session_key,
+                            fact_type,
+                            category,
+                            subject,
+                            predicate,
+                            value,
+                            unit,
+                            date,
+                            confidence,
+                            1 if is_user_action else 0,
+                        ),
+                    )
+
+                created.append(
+                    {
+                        "fact_type": fact_type,
+                        "category": category,
+                        "subject": subject,
+                        "predicate": predicate,
+                        "value": value,
+                        "unit": unit,
+                        "date": date,
+                        "confidence": confidence,
+                        "is_user_action": is_user_action,
+                        "linked_memories": len(memory_ids),
+                    }
+                )
+
+            conn.commit()
+        finally:
+            conn.close()
+
+        return created
 
     # ── Search ───────────────────────────────────────────────────────────
 
