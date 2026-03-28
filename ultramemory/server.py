@@ -1032,6 +1032,22 @@ def _aggregate_sync(req: AggregateRequest):
             structured_answer = len(unique_facts)
             structured_facts = unique_facts
         elif operation in ("sum_duration", "sum_value"):
+            # Dedup by (subject, value, unit) to avoid counting the same
+            # fact multiple times when it was mentioned across sessions.
+            # For "user played Witcher 3 DLC for 20 hours" mentioned in
+            # 12 sessions, we want to count it once, not 12 times.
+            seen_fact_keys = set()
+            unique_sum_facts = []
+            for f in structured_facts:
+                # Normalize subject for dedup
+                subj = f["subject"].lower().strip()
+                val = f["value"] or 0
+                unit = (f.get("unit") or "").lower().strip()
+                dedup_key = (subj, val, unit)
+                if dedup_key not in seen_fact_keys:
+                    seen_fact_keys.add(dedup_key)
+                    unique_sum_facts.append(f)
+            structured_facts = unique_sum_facts
             total = sum(f["value"] or 0 for f in structured_facts)
             # Convert minutes to hours if unit is minutes/hours context
             units = {f.get("unit", "") for f in structured_facts}
