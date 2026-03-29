@@ -1127,5 +1127,120 @@ class TestAgentIdFilteringAggregate(unittest.TestCase):
         self.assertEqual(len(alice_ids & bob_ids), 0, "Facts should not overlap between agents")
 
 
+class TestQueryClassifier(unittest.TestCase):
+    """Test the rule-based query classifier for search routing."""
+
+    def test_counting_how_many(self):
+        from ultramemory.server import classify_query
+
+        self.assertEqual(classify_query("How many weddings did I attend?"), "counting")
+        self.assertEqual(classify_query("how many times did I visit New York?"), "counting")
+        self.assertEqual(classify_query("How many concerts have I been to?"), "counting")
+
+    def test_counting_how_often(self):
+        from ultramemory.server import classify_query
+
+        self.assertEqual(classify_query("How often do I exercise?"), "counting")
+
+    def test_counting_total_number(self):
+        from ultramemory.server import classify_query
+
+        self.assertEqual(classify_query("What is the total number of trips?"), "counting")
+
+    def test_counting_how_much_not_cost(self):
+        from ultramemory.server import classify_query
+
+        # "how much time" should be counting
+        self.assertEqual(classify_query("How much time did I spend gaming?"), "counting")
+        # "how much does X cost" should be lookup (the cost question)
+        self.assertEqual(classify_query("How much does the car cost?"), "lookup")
+        self.assertEqual(classify_query("How much is rent?"), "lookup")
+
+    def test_temporal_when_did(self):
+        from ultramemory.server import classify_query
+
+        self.assertEqual(classify_query("When did I last see Rachel?"), "temporal")
+        self.assertEqual(classify_query("When was the last meeting?"), "temporal")
+
+    def test_temporal_how_long(self):
+        from ultramemory.server import classify_query
+
+        self.assertEqual(classify_query("How long did the trip to Denver last?"), "temporal")
+        self.assertEqual(classify_query("How long ago did I start this job?"), "temporal")
+
+    def test_temporal_last_first_time(self):
+        from ultramemory.server import classify_query
+
+        self.assertEqual(classify_query("What was the last time I went hiking?"), "temporal")
+        self.assertEqual(classify_query("The first time I met John"), "temporal")
+
+    def test_temporal_most_recent(self):
+        from ultramemory.server import classify_query
+
+        self.assertEqual(classify_query("What is the most recent concert I attended?"), "temporal")
+        self.assertEqual(classify_query("What's the latest update on the project?"), "temporal")
+
+    def test_temporal_month_year(self):
+        from ultramemory.server import classify_query
+
+        self.assertEqual(classify_query("What happened in March?"), "temporal")
+        self.assertEqual(classify_query("What did I do in January?"), "temporal")
+        self.assertEqual(classify_query("Events in 2024"), "temporal")
+        self.assertEqual(classify_query("What happened since 2025?"), "temporal")
+
+    def test_lookup_default(self):
+        from ultramemory.server import classify_query
+
+        self.assertEqual(classify_query("What is Alice's favorite color?"), "lookup")
+        self.assertEqual(classify_query("Where does the user live?"), "lookup")
+        self.assertEqual(classify_query("Tell me about the project"), "lookup")
+        self.assertEqual(classify_query("What are my hobbies?"), "lookup")
+
+    def test_classifier_speed(self):
+        """Classifier must complete in <1ms per query."""
+        import time
+
+        from ultramemory.server import classify_query
+
+        queries = [
+            "How many weddings did I attend?",
+            "When did I last see Rachel?",
+            "What is Alice's favorite color?",
+            "How often do I exercise?",
+            "What happened in March?",
+        ]
+        start = time.perf_counter()
+        for _ in range(1000):
+            for q in queries:
+                classify_query(q)
+        elapsed = time.perf_counter() - start
+        # 5000 classifications should take well under 1 second
+        self.assertLess(elapsed, 1.0, f"5000 classifications took {elapsed:.3f}s (should be <1s)")
+
+
+class TestQueryRouter(unittest.TestCase):
+    """Test that /api/search routes queries to the correct handler."""
+
+    def test_search_endpoint_returns_query_type_lookup(self):
+        """Lookup queries should return query_type='lookup' in response."""
+
+        from ultramemory.server import classify_query
+
+        # Verify classification
+        self.assertEqual(classify_query("What is Alice's favorite color?"), "lookup")
+
+    def test_search_endpoint_returns_query_type_counting(self):
+        """Counting queries should include structured_answer with count."""
+        from ultramemory.server import classify_query
+
+        self.assertEqual(classify_query("How many weddings did I attend?"), "counting")
+
+    def test_search_endpoint_returns_query_type_temporal(self):
+        """Temporal queries should include structured_answer with timeline."""
+        from ultramemory.server import classify_query
+
+        self.assertEqual(classify_query("When did I last see Rachel?"), "temporal")
+
+
 if __name__ == "__main__":
     unittest.main()

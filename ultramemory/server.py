@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from datetime import datetime
 from functools import partial
 
@@ -125,6 +126,44 @@ class IngestRequest(BaseModel):
         if len(v.encode("utf-8")) > max_bytes:
             raise ValueError(f"Ingest text exceeds maximum size of {max_bytes} bytes")
         return v
+
+
+# ── Query Classification ───────────────────────────────────────────────────
+
+_COUNTING_PATTERNS = re.compile(
+    r"\b(?:how many|how often|count of|total number of|how much(?!\s+(?:does|do|is|was|did)\b))\b",
+    re.IGNORECASE,
+)
+
+_MONTH_NAMES = (
+    r"january|february|march|april|may|june|"
+    r"july|august|september|october|november|december"
+)
+_TEMPORAL_PATTERNS = re.compile(
+    r"\b(?:"
+    r"when did|when was|when were|when is|"
+    r"how long (?:did|was|were|has|have|ago)|"
+    r"last time|first time|most recent|latest|earliest|"
+    r"before .{1,30}(?:happened|started|began)|"
+    r"after .{1,30}(?:happened|started|began)|"
+    r"during (?:the |my )|"
+    r"(?:in|since|until|from|between) (?:(?:19|20)\d{2})|"
+    r"in (?:" + _MONTH_NAMES + r")"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def classify_query(query: str) -> str:
+    """Classify a search query into 'counting', 'temporal', or 'lookup'.
+
+    Uses compiled regex patterns for speed (<1ms). No LLM calls.
+    """
+    if _COUNTING_PATTERNS.search(query):
+        return "counting"
+    if _TEMPORAL_PATTERNS.search(query):
+        return "temporal"
+    return "lookup"
 
 
 class SearchRequest(BaseModel):
@@ -328,8 +367,15 @@ async def refresh_cache():
 
 @app.post("/api/search")
 async def search(req: SearchRequest):
+    query_type = classify_query(req.query)
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, partial(_search_sync, req))
+    if query_type == "counting":
+        return await loop.run_in_executor(None, partial(_counting_search_sync, req))
+    elif query_type == "temporal":
+        return await loop.run_in_executor(None, partial(_temporal_search_sync, req))
+    result = await loop.run_in_executor(None, partial(_search_sync, req))
+    result["query_type"] = "lookup"
+    return result
 
 
 def _search_sync(req: SearchRequest):
@@ -458,6 +504,371 @@ def _search_sync(req: SearchRequest):
         for r in results:
             r.pop("source_chunk", None)
     return {"results": results, "count": len(results)}
+
+
+# ── Query-Routed Search Helpers ────────────────────────────────────────────
+
+
+def _counting_search_sync(req: SearchRequest):
+    """Counting route: embedding search + structured_facts + canonical dedup.
+
+    Returns normal search results augmented with structured count data.
+    """
+    # Phase 1: Broad embedding search for evidence
+    wide_req = SearchRequest(
+        query=req.query,
+        top_k=50,
+        current_only=req.current_only,
+        as_of_date=req.as_of_date,
+        include_source=req.include_source,
+        agent_id=req.agent_id,
+        agent_id_prefix=req.agent_id_prefix,
+    )
+    base_results = _search_sync(wide_req)
+    memories = base_results.get("results", [])
+
+    # Phase 2: Query structured_facts for matching facts
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = sqlite3.Row
+
+    agent_filter = req.agent_id or req.agent_id_prefix
+    use_agent_join = agent_filter is not None
+
+    col_prefix = "sf." if use_agent_join else ""
+    fact_conditions = [f"{col_prefix}is_user_action = 1"]
+    fact_params: list = []
+
+    # Extract topic keywords from query for structured_facts matching
+    query_lower = req.query.lower()
+    _stop = {
+        "how",
+        "many",
+        "much",
+        "did",
+        "do",
+        "have",
+        "has",
+        "had",
+        "i",
+        "my",
+        "me",
+        "the",
+        "a",
+        "an",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "of",
+        "and",
+        "or",
+        "is",
+        "was",
+        "were",
+        "what",
+        "which",
+        "when",
+        "where",
+        "who",
+        "all",
+        "total",
+        "different",
+        "times",
+        "time",
+        "about",
+        "does",
+    }
+    topic_words = re.findall(r"\b[a-z]+\b", query_lower)
+    topic_keywords = [w for w in topic_words if w not in _stop and len(w) > 2]
+
+    if topic_keywords:
+        kw_clauses = []
+        for kw in topic_keywords:
+            kw_clauses.append(
+                f"({col_prefix}subject LIKE ? OR {col_prefix}value LIKE ? "
+                f"OR {col_prefix}category LIKE ? OR {col_prefix}predicate LIKE ?)"
+            )
+            fact_params.extend([f"%{kw}%"] * 4)
+        fact_conditions.append("(" + " OR ".join(kw_clauses) + ")")
+
+    if agent_filter:
+        if req.agent_id:
+            fact_conditions.append("m.source_agent = ?")
+            fact_params.append(req.agent_id)
+        else:
+            fact_conditions.append("m.source_agent LIKE ?")
+            fact_params.append(f"{req.agent_id_prefix}%")
+
+    fact_where = " AND ".join(fact_conditions)
+
+    if use_agent_join:
+        fact_rows = conn.execute(
+            f"""SELECT sf.id, sf.fact_type, sf.category, sf.subject, sf.predicate,
+                       sf.value, sf.unit, sf.date, sf.confidence, sf.is_user_action,
+                       sf.session_key, sf.canonical_event_id
+                FROM structured_facts sf
+                JOIN memories m ON sf.memory_id = m.id
+                WHERE {fact_where}
+                ORDER BY sf.date DESC""",
+            fact_params,
+        ).fetchall()
+    else:
+        fact_rows = conn.execute(
+            f"""SELECT id, fact_type, category, subject, predicate,
+                       value, unit, date, confidence, is_user_action, session_key,
+                       canonical_event_id
+                FROM structured_facts WHERE {fact_where}
+                ORDER BY date DESC""",
+            fact_params,
+        ).fetchall()
+
+    structured_facts = [dict(r) for r in fact_rows]
+
+    # Phase 3: Deduplicate by canonical_event_id
+    seen_canonical: set[str] = set()
+    seen_subjects: set[str] = set()
+    unique_facts: list[dict] = []
+    for f in structured_facts:
+        canonical_id = f.get("canonical_event_id")
+        if canonical_id:
+            if canonical_id not in seen_canonical:
+                seen_canonical.add(canonical_id)
+                unique_facts.append(f)
+        else:
+            subj_key = (f.get("subject") or "").lower().strip()
+            if subj_key and subj_key not in seen_subjects:
+                seen_subjects.add(subj_key)
+                unique_facts.append(f)
+
+    # Also get event_clusters for cross-reference
+    cluster_conditions: list[str] = []
+    cluster_params: list = []
+    if agent_filter:
+        if req.agent_id:
+            cluster_conditions.append("""id IN (
+                SELECT ecm.cluster_id FROM event_cluster_members ecm
+                JOIN event_mentions em ON em.id = ecm.event_id
+                JOIN event_mention_memories emm ON emm.event_id = em.id
+                JOIN memories m ON m.id = emm.memory_id
+                WHERE m.source_agent = ?
+            )""")
+            cluster_params.append(req.agent_id)
+        elif req.agent_id_prefix:
+            cluster_conditions.append("""id IN (
+                SELECT ecm.cluster_id FROM event_cluster_members ecm
+                JOIN event_mentions em ON em.id = ecm.event_id
+                JOIN event_mention_memories emm ON emm.event_id = em.id
+                JOIN memories m ON m.id = emm.memory_id
+                WHERE m.source_agent LIKE ?
+            )""")
+            cluster_params.append(f"{req.agent_id_prefix}%")
+
+    if topic_keywords:
+        kw_conds = []
+        for kw in topic_keywords:
+            kw_conds.append("(event_type LIKE ? OR subtype LIKE ? OR canonical_label LIKE ?)")
+            cluster_params.extend([f"%{kw}%"] * 3)
+        cluster_conditions.append("(" + " OR ".join(kw_conds) + ")")
+
+    cluster_where = " AND ".join(cluster_conditions) if cluster_conditions else "1=1"
+    clusters = conn.execute(
+        f"""SELECT id, event_type, subtype, canonical_label, distinct_key,
+                   participants, normalized_date, duration_minutes,
+                   user_involvement, confidence
+            FROM event_clusters WHERE {cluster_where}
+            ORDER BY normalized_date DESC""",
+        cluster_params,
+    ).fetchall()
+    event_clusters = [dict(c) for c in clusters]
+
+    conn.close()
+
+    # Build structured count from facts + clusters
+    event_count = len(unique_facts) if unique_facts else len(event_clusters)
+    event_list = [
+        {
+            "subject": f.get("subject"),
+            "date": f.get("date"),
+            "category": f.get("category"),
+            "canonical_event_id": f.get("canonical_event_id"),
+        }
+        for f in unique_facts
+    ]
+
+    # Return top_k memories for evidence, plus structured answer
+    return {
+        "results": memories[: req.top_k],
+        "count": len(memories[: req.top_k]),
+        "query_type": "counting",
+        "structured_answer": {
+            "count": event_count,
+            "events": event_list[:50],
+            "source": "structured_facts" if unique_facts else "event_clusters",
+            "fact_count": len(unique_facts),
+            "cluster_count": len(event_clusters),
+        },
+    }
+
+
+def _temporal_search_sync(req: SearchRequest):
+    """Temporal route: embedding search + date-aware structured_facts + event_clusters.
+
+    Returns results sorted by date with timeline metadata.
+    """
+    # Determine sort direction from query
+    query_lower = req.query.lower()
+    oldest_first = bool(re.search(r"\b(?:first time|earliest|oldest)\b", query_lower))
+
+    # Phase 1: Broad embedding search
+    wide_req = SearchRequest(
+        query=req.query,
+        top_k=50,
+        current_only=req.current_only,
+        as_of_date=req.as_of_date,
+        include_source=req.include_source,
+        agent_id=req.agent_id,
+        agent_id_prefix=req.agent_id_prefix,
+    )
+    base_results = _search_sync(wide_req)
+    memories = base_results.get("results", [])
+
+    # Phase 2: Query structured_facts with dates
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = sqlite3.Row
+
+    agent_filter = req.agent_id or req.agent_id_prefix
+    use_agent_join = agent_filter is not None
+
+    col_prefix = "sf." if use_agent_join else ""
+    fact_conditions = [f"{col_prefix}date IS NOT NULL"]
+    fact_params: list = []
+
+    if agent_filter:
+        if req.agent_id:
+            fact_conditions.append("m.source_agent = ?")
+            fact_params.append(req.agent_id)
+        else:
+            fact_conditions.append("m.source_agent LIKE ?")
+            fact_params.append(f"{req.agent_id_prefix}%")
+
+    sort_dir = "ASC" if oldest_first else "DESC"
+    fact_where = " AND ".join(fact_conditions)
+
+    if use_agent_join:
+        fact_rows = conn.execute(
+            f"""SELECT sf.id, sf.fact_type, sf.category, sf.subject, sf.predicate,
+                       sf.value, sf.unit, sf.date, sf.confidence, sf.is_user_action,
+                       sf.session_key, sf.canonical_event_id
+                FROM structured_facts sf
+                JOIN memories m ON sf.memory_id = m.id
+                WHERE {fact_where}
+                ORDER BY sf.date {sort_dir}""",
+            fact_params,
+        ).fetchall()
+    else:
+        fact_rows = conn.execute(
+            f"""SELECT id, fact_type, category, subject, predicate,
+                       value, unit, date, confidence, is_user_action, session_key,
+                       canonical_event_id
+                FROM structured_facts WHERE {fact_where}
+                ORDER BY date {sort_dir}""",
+            fact_params,
+        ).fetchall()
+
+    dated_facts = [dict(r) for r in fact_rows]
+
+    # Phase 3: Get event_clusters with normalized_date
+    cluster_conditions = ["normalized_date IS NOT NULL"]
+    cluster_params: list = []
+    if agent_filter:
+        if req.agent_id:
+            cluster_conditions.append("""id IN (
+                SELECT ecm.cluster_id FROM event_cluster_members ecm
+                JOIN event_mentions em ON em.id = ecm.event_id
+                JOIN event_mention_memories emm ON emm.event_id = em.id
+                JOIN memories m ON m.id = emm.memory_id
+                WHERE m.source_agent = ?
+            )""")
+            cluster_params.append(req.agent_id)
+        elif req.agent_id_prefix:
+            cluster_conditions.append("""id IN (
+                SELECT ecm.cluster_id FROM event_cluster_members ecm
+                JOIN event_mentions em ON em.id = ecm.event_id
+                JOIN event_mention_memories emm ON emm.event_id = em.id
+                JOIN memories m ON m.id = emm.memory_id
+                WHERE m.source_agent LIKE ?
+            )""")
+            cluster_params.append(f"{req.agent_id_prefix}%")
+
+    cluster_where = " AND ".join(cluster_conditions)
+    clusters = conn.execute(
+        f"""SELECT id, event_type, subtype, canonical_label, distinct_key,
+                   participants, normalized_date, duration_minutes,
+                   user_involvement, confidence
+            FROM event_clusters WHERE {cluster_where}
+            ORDER BY normalized_date {sort_dir}""",
+        cluster_params,
+    ).fetchall()
+    event_clusters = [dict(c) for c in clusters]
+
+    conn.close()
+
+    # Sort memories by date (document_date or event_date)
+    def _date_key(m: dict) -> str:
+        return m.get("document_date") or m.get("event_date") or ""
+
+    memories_sorted = sorted(memories, key=_date_key, reverse=not oldest_first)
+
+    # Build timeline from facts + clusters
+    timeline: list[dict] = []
+    seen_canonical: set[str] = set()
+
+    for f in dated_facts:
+        canonical_id = f.get("canonical_event_id")
+        if canonical_id and canonical_id in seen_canonical:
+            continue
+        if canonical_id:
+            seen_canonical.add(canonical_id)
+        timeline.append(
+            {
+                "date": f.get("date"),
+                "description": f"{f.get('subject', '')} {f.get('predicate', '')} {f.get('value', '')}".strip(),
+                "category": f.get("category"),
+                "source": "structured_fact",
+                "canonical_event_id": canonical_id,
+            }
+        )
+
+    for c in event_clusters:
+        timeline.append(
+            {
+                "date": c.get("normalized_date"),
+                "description": c.get("canonical_label", ""),
+                "category": c.get("event_type", ""),
+                "source": "event_cluster",
+                "canonical_event_id": None,
+            }
+        )
+
+    # Sort timeline
+    timeline.sort(key=lambda t: t.get("date") or "", reverse=not oldest_first)
+
+    return {
+        "results": memories_sorted[: req.top_k],
+        "count": len(memories_sorted[: req.top_k]),
+        "query_type": "temporal",
+        "structured_answer": {
+            "timeline": timeline[:50],
+            "sort_order": "oldest_first" if oldest_first else "most_recent_first",
+            "fact_count": len(dated_facts),
+            "cluster_count": len(event_clusters),
+        },
+    }
 
 
 # ── Entity-Aware Search ─────────────────────────────────────────────────────
